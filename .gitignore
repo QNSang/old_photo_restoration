@@ -237,3 +237,7 @@ __marimo__/
 # Generated/runtime artifacts
 data/
 *.pyc
+
+# Keep source modules under src/data trackable.
+!src/data/
+!src/data/*.py

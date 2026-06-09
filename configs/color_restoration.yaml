@@ -1,0 +1,31 @@
+dataset:
+  root: data/processed/ds-color-restoration-320-v001
+  image_size: 256
+  input_profile: quality_restoration_opencv_conservative
+
+model:
+  mode: rgb_residual
+  base_channels: 64
+  residual_scale_init: 0.5
+  residual_scale_min: 0.1
+  residual_scale_max: 1.0
+
+loss:
+  rgb_weight: 1.0
+  ab_weight: 1.0
+  ssim_weight: 0.2
+
+training:
+  epochs: 50
+  batch_size: 8
+  lr: 0.0002
+  weight_decay: 0.0001
+  patience: 10
+  min_delta: 0.0001
+  seed: 42
+  num_workers: auto
+  amp: true
+
+outputs:
+  checkpoint_root: checkpoints/color_restoration
+  experiment_root: experiments/color_restoration

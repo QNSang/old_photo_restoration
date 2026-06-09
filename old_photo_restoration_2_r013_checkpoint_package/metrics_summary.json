@@ -1,0 +1,67 @@
+{
+  "run_name": "r013_gen120_fixed118_local",
+  "epochs_requested": 40,
+  "epochs_executed": 40,
+  "best_epoch_by_iou": 39,
+  "best_val_iou": 0.38123125831286114,
+  "best_epoch_by_f1": 35,
+  "best_val_f1": 0.5499963329897987,
+  "best_iou_metrics": {
+    "epoch": 39,
+    "train": {
+      "loss": 0.38120244159584954,
+      "iou": 0.3399434597009704,
+      "f1": 0.5019332106624331,
+      "precision": 0.49426337154138655,
+      "recall": 0.5320835532177062
+    },
+    "val": {
+      "loss": 0.35165028439627755,
+      "iou": 0.38123125831286114,
+      "f1": 0.5502534508705139,
+      "precision": 0.5193632046381632,
+      "recall": 0.5986307793193393,
+      "mask_ratio": 0.0754042731391059
+    }
+  },
+  "best_f1_metrics": {
+    "epoch": 35,
+    "train": {
+      "loss": 0.37985599750564214,
+      "iou": 0.33835189541180927,
+      "f1": 0.5012086675990195,
+      "precision": 0.4966253233807428,
+      "recall": 0.5247166696048918
+    },
+    "val": {
+      "loss": 0.3528248800171746,
+      "iou": 0.3807208173804813,
+      "f1": 0.5499963329897987,
+      "precision": 0.5194589528772566,
+      "recall": 0.5964227981037564,
+      "mask_ratio": 0.07494333055284289
+    }
+  },
+  "final_row": {
+    "epoch": 40,
+    "train_loss": "0.376362",
+    "train_iou": "0.346279",
+    "train_f1": "0.510590",
+    "train_precision": "0.504751",
+    "train_recall": "0.538156",
+    "val_loss": "0.354036",
+    "val_iou": "0.378821",
+    "val_f1": "0.547911",
+    "val_precision": "0.504742",
+    "val_recall": "0.612706",
+    "val_mask_ratio": "0.079294",
+    "improved_iou": 0,
+    "improved_f1": 0,
+    "epochs_without_improvement": 1
+  },
+  "checkpoint_paths": {
+    "best_val_iou": "F:\\deeplearning\\old_photo_restoration_2\\outputs\\r013_finetune\\r013_gen120_fixed118_local\\best_val_iou.pth",
+    "best_val_f1": "F:\\deeplearning\\old_photo_restoration_2\\outputs\\r013_finetune\\r013_gen120_fixed118_local\\best_val_f1.pth",
+    "last": "F:\\deeplearning\\old_photo_restoration_2\\outputs\\r013_finetune\\r013_gen120_fixed118_local\\last.pth"
+  }
+}

@@ -1,0 +1,41 @@
+timestamp: 2026-06-08T20:56:52+07:00
+
+source: outputs\r013_finetune\r013_gen120_fixed118_local\best_val_iou.pth
+target: checkpoints\segmenter\seg-unet-attn-r013-gen120-fixed118-local\best_val_iou.pth
+size: 1585714
+sha256: A63381ADE991CB936E2262E80FA6001C3A1FE9D10B1075BE0D3C7F617C0A5725
+
+source: outputs\r013_finetune\r013_gen120_fixed118_local\best_val_f1.pth
+target: checkpoints\segmenter\seg-unet-attn-r013-gen120-fixed118-local\best_val_f1.pth
+size: 1585354
+sha256: B71F65E7E5741B22FB57EA40325E3B011ED576706A1E10AA5F22478C8E5C8D70
+
+source: outputs\r013_finetune\r013_gen120_fixed118_local\last.pth
+target: checkpoints\segmenter\seg-unet-attn-r013-gen120-fixed118-local\last.pth
+size: 1571890
+sha256: 21586EEA15200C90C389839BFAE4932DD64FE05482A8FD7ECECDF0BD38666E78
+
+source: outputs\r013_finetune\r013_gen120_fixed118_local\metrics_summary.json
+target: checkpoints\segmenter\seg-unet-attn-r013-gen120-fixed118-local\metrics_summary.json
+size: 2111
+sha256: C8E86604BA3A669C8E17630F3DBC3026C33A1FBABBD4BC97BF006E78E1273E63
+
+source: outputs\r013_finetune\r013_gen120_fixed118_local\run_metadata.json
+target: checkpoints\segmenter\seg-unet-attn-r013-gen120-fixed118-local\run_metadata.json
+size: 1720
+sha256: CD1866614F780E2EE7807A7BA2A2039D69659DAE11311812BE02A3D703AD1EED
+
+source: outputs\r013_finetune\r013_gen120_fixed118_local\r013_candidate_evaluation_summary.md
+target: checkpoints\segmenter\seg-unet-attn-r013-gen120-fixed118-local\r013_candidate_evaluation_summary.md
+size: 5272
+sha256: E2156509492D42201C6640EFC0393DFFBA6BEED9C1D972E1E778D2753E89FCF3
+
+source: outputs\r013_finetune\r013_gen120_fixed118_local\fair_r011_vs_r013_test.csv
+target: checkpoints\segmenter\seg-unet-attn-r013-gen120-fixed118-local\fair_r011_vs_r013_test.csv
+size: 180
+sha256: 6C2C451CA971E71F60672268A9884BE82C5863321817DB59D99DCDED8B7845F4
+
+source: outputs\r013_finetune\r013_gen120_fixed118_local\threshold_sweep_val.csv
+target: checkpoints\segmenter\seg-unet-attn-r013-gen120-fixed118-local\threshold_sweep_val.csv
+size: 673
+sha256: D8883BC8F8D7A7EC6C4267BEEE304B4A8897AB625E5E7B99509E0FEF2E78CA36

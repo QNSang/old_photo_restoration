@@ -28,6 +28,11 @@ from src.restoration.dependency_checks import (
 )
 from src.restoration.face_restoration import VALID_FACE_MODES, apply_face_restoration
 from src.restoration.official_lama_adapter import OFFICIAL_LAMA_CHECKPOINT, run_official_lama_subprocess
+from src.restoration.post_restoration import (
+    VALID_POST_PIPELINES,
+    VALID_QUALITY_MODES,
+    run_pikfix_post_pipeline,
+)
 
 
 R011_CHECKPOINT = PROJECT_ROOT / "checkpoints" / "segmenter" / "seg-unet-attn-r011-repair-ft-s42" / "best_iou.ckpt"
@@ -83,6 +88,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--face-strength", type=float, default=0.5)
     parser.add_argument("--codeformer-fidelity", type=float, default=None)
     parser.add_argument("--skip-face-restoration", action="store_true")
+    parser.add_argument("--post-pipeline", choices=sorted(VALID_POST_PIPELINES), default="legacy")
+    parser.add_argument("--quality-mode", choices=sorted(VALID_QUALITY_MODES), default="opencv_conservative")
+    parser.add_argument("--color-checkpoint", default="")
+    parser.add_argument("--color-reference", default="")
+    parser.add_argument("--realesrgan-repo", default="")
+    parser.add_argument("--realesrgan-env", default="realesrgan")
+    parser.add_argument("--realesrgan-model-name", default="RealESRGAN_x4plus")
+    parser.add_argument("--realesrgan-outscale", type=float, default=2.0)
+    parser.add_argument("--final-color-match", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--final-color-match-strength", type=float, default=0.35)
     parser.add_argument("--save-all-masks", action=argparse.BooleanOptionalAction, default=True)
     return parser.parse_args()
 
@@ -155,14 +170,28 @@ def label_tile(tile_rgb: np.ndarray, label: str) -> np.ndarray:
     return tile
 
 
-def rebuild_pipeline_comparison_grid(final_dir: Path) -> None:
-    items = [
-        ("input", final_dir / "input.png"),
-        ("final mask", final_dir / "final_mask.png"),
-        ("overlay final", final_dir / "overlay_final.png"),
-        ("restored before face", final_dir / "restored_before_face.png"),
-        ("restored final", final_dir / "restored_final.png"),
-    ]
+def rebuild_pipeline_comparison_grid(final_dir: Path, post_pipeline: str = "legacy") -> None:
+    if post_pipeline == "pikfix_experimental":
+        items = [
+            ("input", final_dir / "input.png"),
+            ("final mask", final_dir / "final_mask.png"),
+            ("after inpaint", final_dir / "restored_before_post.png"),
+            ("quality restored", final_dir / "quality_restored.png"),
+            ("color restored", final_dir / "color_restored.png"),
+            ("Real-ESRGAN", final_dir / "realesrgan_restored.png"),
+            ("before CodeFormer", final_dir / "restored_before_face.png"),
+            ("CodeFormer", final_dir / "codeformer_restored.png"),
+            ("final color match", final_dir / "final_color_matched.png"),
+            ("restored final", final_dir / "restored_final.png"),
+        ]
+    else:
+        items = [
+            ("input", final_dir / "input.png"),
+            ("final mask", final_dir / "final_mask.png"),
+            ("overlay final", final_dir / "overlay_final.png"),
+            ("restored before face", final_dir / "restored_before_face.png"),
+            ("restored final", final_dir / "restored_final.png"),
+        ]
     tiles: list[np.ndarray] = []
     for label, path in items:
         if path.exists():
@@ -372,14 +401,48 @@ def main() -> int:
 
     effective_face_mode = "off" if args.skip_face_restoration else args.face_mode
     codeformer_fidelity = args.codeformer_fidelity if args.codeformer_fidelity is not None else args.face_strength
-    face_restored_rgb, face_metadata = apply_face_restoration(
-        read_rgb(restored_before_face),
-        mode=effective_face_mode,
-        strength=codeformer_fidelity,
-        output_dir=final_dir / "face_module",
-    )
     restored_final = final_dir / "restored_final.png"
-    write_rgb(restored_final, face_restored_rgb)
+    post_metadata: dict[str, Any] = {
+        "post_pipeline": "legacy",
+        "post_pipeline_stages": [],
+        "quality_restoration_applied": False,
+        "color_restoration_applied": False,
+        "color_reference": None,
+        "realesrgan_applied": False,
+        "realesrgan_outscale": None,
+        "final_color_match_applied": False,
+        "stage_outputs": {},
+        "stage_warnings": [],
+    }
+    if args.post_pipeline == "pikfix_experimental":
+        color_checkpoint = resolve_path(args.color_checkpoint) if args.color_checkpoint else None
+        color_reference = resolve_path(args.color_reference) if args.color_reference else None
+        realesrgan_repo = resolve_path(args.realesrgan_repo) if args.realesrgan_repo else None
+        post_restored_rgb, post_metadata = run_pikfix_post_pipeline(
+            read_rgb(restored_before_face),
+            final_dir,
+            quality_mode=args.quality_mode,
+            color_checkpoint=color_checkpoint,
+            color_reference=color_reference,
+            realesrgan_repo=realesrgan_repo,
+            realesrgan_env=args.realesrgan_env,
+            realesrgan_model_name=args.realesrgan_model_name,
+            realesrgan_outscale=args.realesrgan_outscale,
+            face_mode=effective_face_mode,
+            codeformer_fidelity=codeformer_fidelity,
+            final_color_match=args.final_color_match,
+            final_color_match_strength=args.final_color_match_strength,
+        )
+        face_metadata = dict(post_metadata.get("face_metadata") or {})
+        write_rgb(restored_final, post_restored_rgb)
+    else:
+        face_restored_rgb, face_metadata = apply_face_restoration(
+            read_rgb(restored_before_face),
+            mode=effective_face_mode,
+            strength=codeformer_fidelity,
+            output_dir=final_dir / "face_module",
+        )
+        write_rgb(restored_final, face_restored_rgb)
 
     metadata_path = final_dir / "metadata.json"
     metadata: dict[str, Any] = {}
@@ -395,7 +458,7 @@ def main() -> int:
             fallback_chain = ["auto", actual_backend]
     metadata["pipeline_mode"] = args.mode
     metadata["mask_mode"] = args.mode
-    metadata["experimental"] = bool(mode_config.get("experimental", False))
+    metadata["experimental"] = bool(mode_config.get("experimental", False) or args.post_pipeline != "legacy")
     if mode_config.get("experimental"):
         metadata["low_threshold"] = effective_threshold
         metadata["original_baseline"] = mode_config.get("original_baseline")
@@ -450,9 +513,22 @@ def main() -> int:
     metadata["codeformer_fidelity"] = face_metadata.get("codeformer_fidelity")
     metadata["codeformer_output"] = face_metadata.get("codeformer_output")
     metadata["codeformer_result"] = face_metadata.get("codeformer_result")
+    metadata["post_pipeline"] = args.post_pipeline
+    metadata["post_pipeline_stages"] = post_metadata.get("post_pipeline_stages", [])
+    metadata["quality_restoration_applied"] = bool(post_metadata.get("quality_restoration_applied", False))
+    metadata["color_restoration_applied"] = bool(post_metadata.get("color_restoration_applied", False))
+    metadata["color_reference"] = post_metadata.get("color_reference")
+    metadata["realesrgan_applied"] = bool(post_metadata.get("realesrgan_applied", False))
+    metadata["realesrgan_outscale"] = post_metadata.get("realesrgan_outscale")
+    metadata["final_color_match_applied"] = bool(post_metadata.get("final_color_match_applied", False))
+    metadata["stage_outputs"] = post_metadata.get("stage_outputs", {})
+    metadata["stage_warnings"] = post_metadata.get("stage_warnings", [])
     metadata["errors_or_warnings"] = build_errors_or_warnings(metadata, face_metadata)
+    metadata["errors_or_warnings"].extend(
+        warning for warning in metadata["stage_warnings"] if warning not in metadata["errors_or_warnings"]
+    )
     metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
-    rebuild_pipeline_comparison_grid(final_dir)
+    rebuild_pipeline_comparison_grid(final_dir, post_pipeline=args.post_pipeline)
 
     print(f"image: {image_path}")
     print(f"mode: {args.mode}")
@@ -463,6 +539,9 @@ def main() -> int:
     print(f"face_mode: {effective_face_mode}")
     print(f"face_restoration_applied: {metadata.get('face_restoration_applied', False)}")
     print(f"face_reason: {metadata.get('face_reason', '')}")
+    print(f"post_pipeline: {args.post_pipeline}")
+    print(f"realesrgan_applied: {metadata.get('realesrgan_applied', False)}")
+    print(f"color_restoration_applied: {metadata.get('color_restoration_applied', False)}")
     print(f"output_dir: {final_dir}")
     print(f"comparison_grid: {final_dir / 'comparison_grid.png'}")
     print(f"restored_before_face: {restored_before_face}")

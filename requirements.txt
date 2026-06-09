@@ -16,3 +16,5 @@ matplotlib>=3.7.0
 pandas>=2.0.0
 gradio>=4.0.0
 ipykernel>=6.0.0
+kornia>=0.7.0
+PyYAML>=6.0

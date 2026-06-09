@@ -64,6 +64,7 @@ def apply_face_restoration(
     mode: str = "auto",
     strength: float = 0.5,
     output_dir: Path | None = None,
+    face_upsample: bool = True,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """Áp dụng Module 3 nếu adapter CodeFormer đã sẵn sàng; nếu chưa thì trả ảnh gốc kèm metadata."""
     if mode not in VALID_FACE_MODES:
@@ -103,7 +104,7 @@ def apply_face_restoration(
         output_path / "face_input.png",
         output_path,
         fidelity=float(strength),
-        face_upsample=True,
+        face_upsample=face_upsample,
     )
     if codeformer_result.get("ok"):
         codeformer_output = Path(str(codeformer_result["output"]))
