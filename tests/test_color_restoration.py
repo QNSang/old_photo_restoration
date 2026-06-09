@@ -1,13 +1,21 @@
 from __future__ import annotations
 
 import csv
+import json
 from pathlib import Path
 
 import numpy as np
 import pytest
 import torch
 
-from scripts.generate_color_dataset import audit_sources, main as generate_dataset_main, split_sources
+from scripts.generate_color_dataset import (
+    audit_sources,
+    main as generate_dataset_main,
+    prepare_model_input,
+    prepare_training_target,
+    select_source_subset,
+    split_sources,
+)
 from scripts.train_restoration import resolve_num_workers
 from src.data.color_degradation import ColorDegradationConfig, DegradationSimulator
 from src.models.color_unet import ColorRestorationUNet
@@ -38,6 +46,58 @@ def test_color_degradation_is_deterministic_and_configurable() -> None:
     assert set(first_metadata["applied"]) == {"yellowing", "fading", "sepia", "gamma", "color_cast", "blur", "noise", "jpeg"}
 
 
+def test_real_old_photo_heavy_profile_is_deterministic_and_uses_named_subprofile() -> None:
+    image = np.dstack(
+        [
+            np.full((64, 64), 80, dtype=np.uint8),
+            np.full((64, 64), 140, dtype=np.uint8),
+            np.full((64, 64), 200, dtype=np.uint8),
+        ]
+    )
+    simulator = DegradationSimulator(profile="real_old_photo_heavy")
+    first, first_metadata = simulator.apply(image, seed=99, return_metadata=True)
+    second, second_metadata = simulator.apply(image, seed=99, return_metadata=True)
+
+    assert np.array_equal(first, second)
+    assert first_metadata == second_metadata
+    assert first_metadata["profile"] == "real_old_photo_heavy"
+    assert first_metadata["subprofile"] in {
+        "strong_sepia",
+        "warm_near_grayscale",
+        "faded_old_color",
+        "mild_degradation",
+        "identity",
+    }
+    assert "color_cast" not in first_metadata["applied"]
+
+
+def test_conservative_target_reduces_saturation_for_near_grayscale_input() -> None:
+    import cv2
+
+    clean = np.full((48, 48, 3), [210, 70, 45], dtype=np.uint8)
+    target, metadata = prepare_training_target(
+        clean,
+        {"subprofile": "warm_near_grayscale"},
+        "conservative_real_old_photo",
+        seed=42,
+    )
+    clean_saturation = float(cv2.cvtColor(clean, cv2.COLOR_RGB2HSV)[:, :, 1].mean())
+    target_saturation = float(cv2.cvtColor(target, cv2.COLOR_RGB2HSV)[:, :, 1].mean())
+
+    assert target_saturation < clean_saturation * 0.30
+    assert metadata["source_subprofile"] == "warm_near_grayscale"
+    assert 0.08 <= metadata["saturation_scale"] <= 0.25
+
+
+def test_color_only_model_input_skips_quality_restoration() -> None:
+    degraded = np.full((32, 40, 3), [130, 110, 80], dtype=np.uint8)
+    model_input, metadata = prepare_model_input(degraded, "off")
+
+    assert np.array_equal(model_input, degraded)
+    assert metadata["reason"] == "color_only_training"
+    assert metadata["backend"] == "none"
+
+
 def test_source_audit_rejects_small_images_and_split_has_no_leakage(tmp_path: Path) -> None:
     import cv2
 
@@ -54,6 +114,15 @@ def test_source_audit_rejects_small_images_and_split_has_no_leakage(tmp_path: Pa
     assert not split_ids[0].intersection(split_ids[1])
     assert not split_ids[0].intersection(split_ids[2])
     assert not split_ids[1].intersection(split_ids[2])
+
+
+def test_select_source_subset_is_deterministic() -> None:
+    sources = [Path(f"source_{index}.png") for index in range(20)]
+    first = select_source_subset(sources, max_sources=10, seed=42)
+    second = select_source_subset(sources, max_sources=10, seed=42)
+
+    assert first == second
+    assert len(first) == 10
 
 
 def test_dataset_generator_writes_manifest_audit_and_comparison_grid(tmp_path: Path, monkeypatch) -> None:
@@ -73,7 +142,9 @@ def test_dataset_generator_writes_manifest_audit_and_comparison_grid(tmp_path: P
             "--crop-size", "32",
             "--train-variants", "1",
             "--eval-variants", "1",
-            "--quality-mode", "off",
+            "--max-sources", "3",
+            "--degradation-profile", "real_old_photo_heavy",
+            "--target-profile", "conservative_real_old_photo",
             "--num-previews", "2",
         ],
     )
@@ -85,6 +156,14 @@ def test_dataset_generator_writes_manifest_audit_and_comparison_grid(tmp_path: P
     assert {row["split"] for row in rows} == {"train", "val", "test"}
     assert (output_root / "source_audit.csv").exists()
     assert (output_root / "previews" / "comparison_grid.png").exists()
+    metadata = json.loads((output_root / "dataset_metadata.json").read_text(encoding="utf-8"))
+    assert metadata["quality_mode"] == "off"
+    assert metadata["input_profile"] == "synthetic_real_old_photo_heavy_direct"
+    assert metadata["training_objective"] == "conservative_color_restoration"
+    assert metadata["degradation_profile"] == "real_old_photo_heavy"
+    assert metadata["target_profile"] == "conservative_real_old_photo"
+    assert metadata["selected_sources"] == 3
+    assert all(row["target_path"] for row in rows)
 
 
 def test_rgb_residual_model_has_bounded_learnable_scale_and_backward() -> None:

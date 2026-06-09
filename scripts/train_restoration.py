@@ -40,6 +40,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--resume")
+    parser.add_argument("--init-checkpoint", help="Load model weights only for a new fine-tuning run.")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--overwrite-run", action="store_true")
     return parser.parse_args()
@@ -75,6 +76,21 @@ def apply_overrides(config: dict[str, Any], args: argparse.Namespace) -> dict[st
 def resolve_path(value: str) -> Path:
     path = Path(value)
     return path if path.is_absolute() else (PROJECT_ROOT / path).resolve()
+
+
+def apply_dataset_metadata(config: dict[str, Any], dataset_root: Path) -> dict[str, Any]:
+    metadata_path = dataset_root / "dataset_metadata.json"
+    if not metadata_path.exists():
+        return config
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    input_profile = metadata.get("input_profile")
+    if input_profile:
+        config["dataset"]["input_profile"] = str(input_profile)
+    config["dataset"]["quality_mode"] = str(metadata.get("quality_mode", "unknown"))
+    config["dataset"]["degradation_profile"] = str(metadata.get("degradation_profile", "unknown"))
+    config["dataset"]["target_profile"] = str(metadata.get("target_profile", "clean_rgb"))
+    config["dataset"]["training_objective"] = str(metadata.get("training_objective", "color_restoration_only"))
+    return config
 
 
 def set_seed(seed: int) -> None:
@@ -231,9 +247,12 @@ def prepare_run_dir(path: Path, overwrite: bool, resume: bool) -> None:
 
 def main() -> int:
     args = parse_args()
+    if args.resume and args.init_checkpoint:
+        raise ValueError("Use only one of --resume or --init-checkpoint")
     config_path = resolve_path(args.config)
     config = apply_overrides(load_config(config_path), args)
     dataset_root = resolve_path(config["dataset"]["root"])
+    config = apply_dataset_metadata(config, dataset_root)
     model_config = dict(config["model"])
     training = config["training"]
     loss_config = config["loss"]
@@ -247,6 +266,15 @@ def main() -> int:
     train_loader = make_loader(train_dataset, int(training["batch_size"]), num_workers, True, device)
     val_loader = make_loader(val_dataset, int(training["batch_size"]), num_workers, False, device)
     model = ColorRestorationUNet(**model_config).to(device)
+    initialized_from = None
+    if args.init_checkpoint:
+        init_path = resolve_path(args.init_checkpoint)
+        init_checkpoint = torch.load(init_path, map_location=device, weights_only=False)
+        if init_checkpoint.get("model_config") != model.get_config():
+            raise ValueError("Init checkpoint model_config does not match the active training config")
+        model.load_state_dict(init_checkpoint["model_state_dict"])
+        initialized_from = str(init_path)
+        config["training"]["initialized_from"] = initialized_from
     loss_fn = ColorRestorationLoss(**loss_config).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(training["lr"]), weight_decay=float(training.get("weight_decay", 1e-4)))
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=int(training["epochs"]))
@@ -327,6 +355,7 @@ def main() -> int:
         "best_val_loss": best_val,
         "epochs_executed": int(history[-1]["epoch"]) if history else 0,
         "checkpoint": str(checkpoint_root / "best.pth"),
+        "initialized_from": initialized_from,
     }
     (experiment_root / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(json.dumps(summary, indent=2))

@@ -1,7 +1,7 @@
 dataset:
   root: data/processed/ds-color-restoration-320-v001
   image_size: 256
-  input_profile: quality_restoration_opencv_conservative
+  input_profile: synthetic_degraded_direct
 
 model:
   mode: rgb_residual

@@ -84,7 +84,7 @@ class ColorRestorationDataset(Dataset):
     def __getitem__(self, index: int) -> dict[str, Any]:
         row = self.samples[index]
         input_path = self.dataset_root / row["input_path"]
-        clean_path = self.dataset_root / row["clean_path"]
+        clean_path = self.dataset_root / (row.get("target_path") or row["clean_path"])
         input_image, clean_image = _paired_crop(
             _load_rgb(input_path),
             _load_rgb(clean_path),
