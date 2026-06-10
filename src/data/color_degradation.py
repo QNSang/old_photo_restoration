@@ -11,7 +11,7 @@ from PIL import Image
 
 
 Array = np.ndarray
-VALID_DEGRADATION_PROFILES = {"balanced", "real_old_photo_heavy"}
+VALID_DEGRADATION_PROFILES = {"balanced", "real_old_photo_heavy", "faded_color_v2"}
 
 
 @dataclass(frozen=True)
@@ -34,6 +34,14 @@ def ensure_rgb_uint8(image: Image.Image | Array) -> Array:
     if array.ndim != 3 or array.shape[2] != 3:
         raise ValueError(f"Expected RGB image with shape HxWx3, got {array.shape}")
     return np.ascontiguousarray(np.clip(array, 0, 255).astype(np.uint8))
+
+
+def mean_lab_chroma(image: Image.Image | Array) -> float:
+    rgb = ensure_rgb_uint8(image)
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    a = lab[:, :, 1] - 128.0
+    b = lab[:, :, 2] - 128.0
+    return float(np.sqrt(a * a + b * b).mean())
 
 
 class DegradationSimulator:
@@ -181,6 +189,58 @@ class DegradationSimulator:
         buffer.seek(0)
         return np.ascontiguousarray(np.asarray(Image.open(buffer).convert("RGB")))
 
+    @staticmethod
+    def _smooth_random_field(
+        height: int,
+        width: int,
+        np_rng: np.random.Generator,
+        low: float,
+        high: float,
+    ) -> Array:
+        coarse = np_rng.uniform(low, high, size=(4, 4)).astype(np.float32)
+        return cv2.resize(coarse, (width, height), interpolation=cv2.INTER_CUBIC)
+
+    def _apply_uneven_fading(self, image: Array, max_strength: float, np_rng: np.random.Generator) -> Array:
+        height, width = image.shape[:2]
+        strength = self._smooth_random_field(height, width, np_rng, 0.0, max_strength)[:, :, None]
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+        gray_rgb = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB).astype(np.float32)
+        source = image.astype(np.float32)
+        return np.clip(source * (1.0 - strength) + gray_rgb * strength, 0, 255).astype(np.uint8)
+
+    def _apply_low_frequency_cast(
+        self,
+        image: Array,
+        max_shift: float,
+        rng: random.Random,
+        np_rng: np.random.Generator,
+    ) -> tuple[Array, dict[str, Any]]:
+        height, width = image.shape[:2]
+        channel = rng.randrange(3)
+        direction = rng.choice([-1.0, 1.0])
+        field = self._smooth_random_field(height, width, np_rng, 0.25, 1.0)
+        result = image.astype(np.float32)
+        result[:, :, channel] += direction * max_shift * field
+        return np.clip(result, 0, 255).astype(np.uint8), {
+            "channel": channel,
+            "direction": direction,
+            "max_shift": max_shift,
+        }
+
+    @staticmethod
+    def _apply_vignette(image: Array, strength: float) -> Array:
+        height, width = image.shape[:2]
+        y, x = np.ogrid[-1.0:1.0:complex(height), -1.0:1.0:complex(width)]
+        radius = np.clip(np.sqrt(x * x + y * y) / np.sqrt(2.0), 0.0, 1.0)
+        gain = 1.0 - strength * radius * radius
+        return np.clip(image.astype(np.float32) * gain[:, :, None], 0, 255).astype(np.uint8)
+
+    @staticmethod
+    def _apply_channel_gamma(image: Array, gammas: list[float]) -> Array:
+        normalized = image.astype(np.float32) / 255.0
+        gamma_array = np.asarray(gammas, dtype=np.float32).reshape(1, 1, 3)
+        return np.clip(np.power(np.clip(normalized, 0.0, 1.0), gamma_array) * 255.0, 0, 255).astype(np.uint8)
+
     def _apply_real_old_photo_heavy(
         self,
         image: Array,
@@ -254,6 +314,98 @@ class DegradationSimulator:
                 applied["jpeg_quality"] = jpeg_quality
         return result, {"subprofile": subprofile, "applied": applied}
 
+    def _apply_faded_color_v2(
+        self,
+        image: Array,
+        rng: random.Random,
+        np_rng: np.random.Generator,
+    ) -> tuple[Array, dict[str, Any]]:
+        draw = rng.random()
+        if draw < 0.20:
+            subprofile = "identity"
+        elif draw < 0.45:
+            subprofile = "mild_yellow_fading"
+        elif draw < 0.80:
+            subprofile = "faded_old_color"
+        elif draw < 0.95:
+            subprofile = "moderate_sepia"
+        else:
+            subprofile = "hard_color_degradation"
+
+        result = image.copy()
+        applied: dict[str, Any] = {}
+        if subprofile != "identity":
+            if subprofile == "mild_yellow_fading":
+                fading_max = rng.uniform(0.10, 0.24)
+                warmth = rng.uniform(0.02, 0.07)
+                contrast = rng.uniform(0.88, 0.98)
+                max_cast = rng.uniform(3.0, 8.0)
+            elif subprofile == "faded_old_color":
+                fading_max = rng.uniform(0.25, 0.48)
+                warmth = rng.uniform(0.04, 0.12)
+                contrast = rng.uniform(0.78, 0.92)
+                max_cast = rng.uniform(5.0, 13.0)
+            elif subprofile == "moderate_sepia":
+                fading_max = rng.uniform(0.28, 0.52)
+                warmth = rng.uniform(0.06, 0.15)
+                contrast = rng.uniform(0.76, 0.90)
+                max_cast = rng.uniform(6.0, 14.0)
+                sepia = rng.uniform(0.18, 0.42)
+                result = self._apply_sepia_strength(result, sepia)
+                applied["sepia"] = sepia
+            else:
+                fading_max = rng.uniform(0.40, 0.58)
+                warmth = rng.uniform(0.08, 0.17)
+                contrast = rng.uniform(0.70, 0.86)
+                max_cast = rng.uniform(8.0, 17.0)
+                sepia = rng.uniform(0.20, 0.45)
+                result = self._apply_sepia_strength(result, sepia)
+                applied["sepia"] = sepia
+
+            result = self._apply_uneven_fading(result, fading_max, np_rng)
+            result = self._apply_warm_paper_tone(result, warmth)
+            result = self._apply_low_contrast(result, contrast, rng.uniform(0.0, 7.0))
+            result, cast_metadata = self._apply_low_frequency_cast(result, max_cast, rng, np_rng)
+            gammas = [rng.uniform(0.90, 1.12) for _ in range(3)]
+            result = self._apply_channel_gamma(result, gammas)
+            applied.update(
+                {
+                    "uneven_fading_max": fading_max,
+                    "warm_paper": warmth,
+                    "contrast_factor": contrast,
+                    "low_frequency_cast": cast_metadata,
+                    "channel_gammas": gammas,
+                }
+            )
+            if rng.random() < 0.45:
+                vignette = rng.uniform(0.04, 0.16)
+                result = self._apply_vignette(result, vignette)
+                applied["vignette"] = vignette
+            if rng.random() < 0.50:
+                sigma = rng.uniform(0.25, 0.75)
+                result = cv2.GaussianBlur(result, (0, 0), sigmaX=sigma, sigmaY=sigma)
+                applied["blur_sigma"] = sigma
+            if rng.random() < 0.55:
+                noise_sigma = rng.uniform(1.0, 5.0)
+                result = self._apply_gaussian_noise(result, noise_sigma, np_rng)
+                applied["noise_sigma"] = noise_sigma
+            if rng.random() < 0.55:
+                jpeg_quality = rng.randint(48, 85)
+                result = self._apply_jpeg_quality(result, jpeg_quality)
+                applied["jpeg_quality"] = jpeg_quality
+        else:
+            applied["identity"] = True
+
+        clean_chroma = mean_lab_chroma(image)
+        degraded_chroma = mean_lab_chroma(result)
+        return result, {
+            "subprofile": subprofile,
+            "applied": applied,
+            "clean_mean_chroma": clean_chroma,
+            "degraded_mean_chroma": degraded_chroma,
+            "chroma_retention": degraded_chroma / max(clean_chroma, 1e-6),
+        }
+
     def apply(
         self,
         image: Image.Image | Array,
@@ -268,8 +420,13 @@ class DegradationSimulator:
         applied: dict[str, Any] = {}
 
         subprofile = None
+        profile_metadata: dict[str, Any] = {}
         if self.profile == "real_old_photo_heavy":
             result, profile_metadata = self._apply_real_old_photo_heavy(result, rng, np_rng)
+            subprofile = profile_metadata["subprofile"]
+            applied = profile_metadata["applied"]
+        elif self.profile == "faded_color_v2":
+            result, profile_metadata = self._apply_faded_color_v2(result, rng, np_rng)
             subprofile = profile_metadata["subprofile"]
             applied = profile_metadata["applied"]
         else:
@@ -294,5 +451,8 @@ class DegradationSimulator:
             "subprofile": subprofile,
             "config": asdict(self.config),
             "applied": applied,
+            "clean_mean_chroma": profile_metadata.get("clean_mean_chroma", mean_lab_chroma(image)),
+            "degraded_mean_chroma": profile_metadata.get("degraded_mean_chroma", mean_lab_chroma(result)),
+            "chroma_retention": profile_metadata.get("chroma_retention"),
         }
         return (result, metadata) if return_metadata else result

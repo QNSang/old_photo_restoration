@@ -19,7 +19,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.data.color_degradation import DegradationSimulator, VALID_DEGRADATION_PROFILES
+from src.data.color_degradation import DegradationSimulator, VALID_DEGRADATION_PROFILES, mean_lab_chroma
 from src.restoration.post_restoration import apply_quality_restoration
 
 
@@ -30,13 +30,24 @@ TARGET_TRANSFORM = "clean_crop_only"
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate paired synthetic data for color restoration.")
-    parser.add_argument("--clean-dir", required=True)
+    parser.add_argument(
+        "--clean-dir",
+        required=True,
+        action="append",
+        help="Clean source directory. Repeat the flag to mix multiple datasets.",
+    )
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--crop-size", type=int, default=320)
     parser.add_argument("--train-variants", type=int, default=3)
     parser.add_argument("--eval-variants", type=int, default=1)
     parser.add_argument("--max-sources", type=int, default=None, help="Deterministically select at most this many clean source images.")
-    parser.add_argument("--degradation-profile", choices=sorted(VALID_DEGRADATION_PROFILES), default="balanced")
+    parser.add_argument("--degradation-profile", choices=sorted(VALID_DEGRADATION_PROFILES), default="faded_color_v2")
+    parser.add_argument(
+        "--min-source-chroma",
+        type=float,
+        default=None,
+        help="Reject clean sources below this mean Lab chroma. V2 defaults to 4.0; legacy profiles default to 0.",
+    )
     parser.add_argument(
         "--target-profile",
         choices=[TARGET_PROFILE],
@@ -48,7 +59,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-raw-degraded", action="store_true")
     parser.add_argument(
         "--quality-mode",
-        default="off",
+        default="opencv_conservative",
         choices=["off", "opencv_conservative"],
         help="Optional pre-processing ablation. Default off trains the color model directly on synthetic degradation.",
     )
@@ -75,14 +86,25 @@ def write_rgb(path: Path, image: np.ndarray) -> None:
         raise RuntimeError(f"Cannot write image: {path}")
 
 
-def source_id(path: Path, clean_root: Path) -> str:
-    relative = path.relative_to(clean_root).as_posix()
-    digest = hashlib.sha1(relative.encode("utf-8")).hexdigest()[:10]
+def _as_roots(clean_roots: Path | list[Path]) -> list[Path]:
+    return [clean_roots] if isinstance(clean_roots, Path) else clean_roots
+
+
+def source_id(path: Path, clean_roots: Path | list[Path]) -> str:
+    roots = _as_roots(clean_roots)
+    matching_root = next((root for root in roots if path.is_relative_to(root)), None)
+    identity = path.as_posix() if matching_root is None else f"{matching_root.name}/{path.relative_to(matching_root).as_posix()}"
+    digest = hashlib.sha1(identity.encode("utf-8")).hexdigest()[:10]
     return f"{path.stem[:48]}-{digest}"
 
 
-def list_sources(clean_root: Path) -> list[Path]:
-    return sorted(path for path in clean_root.rglob("*") if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS)
+def list_sources(clean_roots: Path | list[Path]) -> list[Path]:
+    return sorted(
+        path
+        for clean_root in _as_roots(clean_roots)
+        for path in clean_root.rglob("*")
+        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+    )
 
 
 def select_source_subset(sources: list[Path], max_sources: int | None, seed: int) -> list[Path]:
@@ -95,23 +117,39 @@ def select_source_subset(sources: list[Path], max_sources: int | None, seed: int
     return sorted(random.Random(seed).sample(sources, max_sources))
 
 
-def audit_sources(sources: list[Path], clean_root: Path, crop_size: int, allow_upscale: bool) -> list[dict[str, Any]]:
+def audit_sources(
+    sources: list[Path],
+    clean_root: Path | list[Path],
+    crop_size: int,
+    allow_upscale: bool,
+    min_source_chroma: float = 0.0,
+) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for path in sources:
         image = cv2.imread(str(path), cv2.IMREAD_COLOR)
         if image is None:
-            rows.append({"source_id": source_id(path, clean_root), "source_path": str(path), "width": "", "height": "", "accepted": 0, "reason": "unreadable"})
+            rows.append({"source_id": source_id(path, clean_root), "source_path": str(path), "width": "", "height": "", "mean_chroma": "", "accepted": 0, "reason": "unreadable"})
             continue
         height, width = image.shape[:2]
-        accepted = min(height, width) >= crop_size or allow_upscale
+        chroma = mean_lab_chroma(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+        size_accepted = min(height, width) >= crop_size or allow_upscale
+        chroma_accepted = chroma >= min_source_chroma
+        accepted = size_accepted and chroma_accepted
+        if not size_accepted:
+            reason = f"min_side_below_{crop_size}"
+        elif not chroma_accepted:
+            reason = f"mean_chroma_below_{min_source_chroma:g}"
+        else:
+            reason = "accepted"
         rows.append(
             {
                 "source_id": source_id(path, clean_root),
                 "source_path": str(path),
                 "width": width,
                 "height": height,
+                "mean_chroma": chroma,
                 "accepted": int(accepted),
-                "reason": "accepted" if accepted else f"min_side_below_{crop_size}",
+                "reason": reason,
             }
         )
     return rows
@@ -192,19 +230,26 @@ def prepare_output(output_root: Path, overwrite: bool) -> None:
 
 def main() -> int:
     args = parse_args()
-    clean_root = resolve_path(args.clean_dir)
+    clean_roots = [resolve_path(value) for value in args.clean_dir]
     output_root = resolve_path(args.output_dir)
-    if not clean_root.is_dir():
-        raise NotADirectoryError(f"Clean image directory not found: {clean_root}")
+    missing_roots = [path for path in clean_roots if not path.is_dir()]
+    if missing_roots:
+        raise NotADirectoryError(f"Clean image directories not found: {missing_roots}")
     if args.crop_size <= 0 or args.train_variants <= 0 or args.eval_variants <= 0:
         raise ValueError("crop-size and variant counts must be > 0")
+    if args.min_source_chroma is None:
+        min_source_chroma = 4.0 if args.degradation_profile == "faded_color_v2" else 0.0
+    else:
+        min_source_chroma = float(args.min_source_chroma)
+    if min_source_chroma < 0:
+        raise ValueError("min-source-chroma must be >= 0")
 
-    discovered_sources = list_sources(clean_root)
+    discovered_sources = list_sources(clean_roots)
     if not discovered_sources:
-        raise FileNotFoundError(f"No clean images found under: {clean_root}")
+        raise FileNotFoundError(f"No clean images found under: {clean_roots}")
     sources = select_source_subset(discovered_sources, args.max_sources, args.seed)
     prepare_output(output_root, args.overwrite)
-    audit_rows = audit_sources(sources, clean_root, args.crop_size, args.allow_upscale_small)
+    audit_rows = audit_sources(sources, clean_roots, args.crop_size, args.allow_upscale_small, min_source_chroma)
     splits = split_sources(audit_rows, args.seed)
     source_split = {row["source_id"]: split for split, split_rows in splits.items() for row in split_rows}
     for row in audit_rows:
@@ -212,7 +257,7 @@ def main() -> int:
     write_csv(
         output_root / "source_audit.csv",
         audit_rows,
-        ["source_id", "source_path", "width", "height", "accepted", "reason", "split"],
+        ["source_id", "source_path", "width", "height", "mean_chroma", "accepted", "reason", "split"],
     )
 
     simulator = DegradationSimulator(profile=args.degradation_profile)
@@ -230,6 +275,10 @@ def main() -> int:
                 clean = prepare_clean_crop(source_image, args.crop_size, sample_rng, args.allow_upscale_small)
                 degraded, degradation_metadata = simulator.apply(clean, seed=sample_seed, return_metadata=True)
                 model_input, quality_metadata = prepare_model_input(degraded, args.quality_mode)
+                degradation_subprofile = str(degradation_metadata.get("subprofile") or "mixed")
+                identity_sample = int(degradation_subprofile == "identity")
+                clean_mean_chroma = float(degradation_metadata.get("clean_mean_chroma", mean_lab_chroma(clean)))
+                input_mean_chroma = mean_lab_chroma(model_input)
                 target = clean.copy()
                 target_metadata = {
                     "profile": TARGET_PROFILE,
@@ -259,6 +308,11 @@ def main() -> int:
                         "crop_size": args.crop_size,
                         "quality_mode": args.quality_mode,
                         "degradation_profile": args.degradation_profile,
+                        "degradation_subprofile": degradation_subprofile,
+                        "identity_sample": identity_sample,
+                        "clean_mean_chroma": clean_mean_chroma,
+                        "input_mean_chroma": input_mean_chroma,
+                        "chroma_retention": input_mean_chroma / max(clean_mean_chroma, 1e-6),
                         "target_profile": TARGET_PROFILE,
                         "target_transform": TARGET_TRANSFORM,
                         "quality_metadata": json.dumps(quality_metadata, sort_keys=True),
@@ -278,7 +332,8 @@ def main() -> int:
 
     manifest_fields = [
         "sample_id", "source_id", "source_path", "split", "variant", "seed", "input_path", "target_path", "clean_path",
-        "raw_degraded_path", "crop_size", "quality_mode", "degradation_profile", "target_profile",
+        "raw_degraded_path", "crop_size", "quality_mode", "degradation_profile", "degradation_subprofile",
+        "identity_sample", "clean_mean_chroma", "input_mean_chroma", "chroma_retention", "target_profile",
         "target_transform", "quality_metadata", "degradation_metadata", "target_metadata",
     ]
     write_csv(output_root / "manifest.csv", manifest, manifest_fields)
@@ -297,16 +352,21 @@ def main() -> int:
 
     created_at = datetime.now(timezone.utc).isoformat()
     split_counts = {split: sum(1 for row in manifest if row["split"] == split) for split in ("train", "val", "test")}
+    subprofile_counts = {
+        name: sum(1 for row in manifest if row["degradation_subprofile"] == name)
+        for name in sorted({str(row["degradation_subprofile"]) for row in manifest})
+    }
     metadata = {
         "dataset_id": output_root.name,
         "created_at": created_at,
-        "clean_root": str(clean_root),
+        "clean_roots": [str(path) for path in clean_roots],
         "crop_size": args.crop_size,
         "seed": args.seed,
         "allow_upscale_small": args.allow_upscale_small,
         "save_raw_degraded": args.save_raw_degraded,
         "quality_mode": args.quality_mode,
         "degradation_profile": args.degradation_profile,
+        "min_source_chroma": min_source_chroma,
         "target_profile": TARGET_PROFILE,
         "target_transform": TARGET_TRANSFORM,
         "input_profile": (
@@ -328,6 +388,7 @@ def main() -> int:
         "accepted_sources": sum(int(row["accepted"]) for row in audit_rows),
         "rejected_sources": sum(1 - int(row["accepted"]) for row in audit_rows),
         "split_counts": split_counts,
+        "subprofile_counts": subprofile_counts,
     }
     (output_root / "dataset_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     print(json.dumps(metadata, indent=2))

@@ -1,0 +1,40 @@
+dataset:
+  root: data/processed/ds-color-restoration-v2-320
+  image_size: 256
+  required_quality_mode: opencv_conservative
+  input_profile: synthetic_faded_color_v2_after_opencv_conservative
+
+model:
+  mode: lab_residual
+  base_channels: 32
+  normalization: group
+  residual_scale_init: 0.5
+  residual_scale_min: 0.1
+  residual_scale_max: 1.0
+  lab_l_shift: 15.0
+  lab_ab_shift: 40.0
+
+loss:
+  rgb_weight: 0.5
+  l_weight: 0.5
+  ab_weight: 1.0
+  ssim_weight: 0.2
+  hist_emd_weight: 0.1
+  identity_weight: 0.2
+  hist_bins: 64
+  hist_max_samples: 4096
+
+training:
+  epochs: 50
+  batch_size: 8
+  lr: 0.0002
+  weight_decay: 0.0001
+  patience: 10
+  min_delta: 0.0001
+  seed: 42
+  num_workers: auto
+  amp: true
+
+outputs:
+  checkpoint_root: checkpoints/color_restoration
+  experiment_root: experiments/color_restoration

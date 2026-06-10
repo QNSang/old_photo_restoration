@@ -7,11 +7,11 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from src.losses.color_restoration import reconstruct_lab_ab
-from src.models.color_unet import ColorRestorationUNet
+from src.losses.color_restoration import reconstruct_lab_ab, reconstruct_lab_residual
+from src.models.color_unet import ColorRestorationUNet, normalize_color_model_config
 
 
-CHECKPOINT_FORMAT_VERSION = 1
+CHECKPOINT_FORMAT_VERSION = 2
 
 
 def resolve_torch_device(device: str = "auto") -> torch.device:
@@ -33,16 +33,24 @@ def load_color_checkpoint(
     checkpoint = torch.load(path, map_location=resolved_device, weights_only=False)
     if "model_state_dict" not in checkpoint or "model_config" not in checkpoint:
         raise ValueError(f"Invalid color checkpoint contract: {path}")
-    model = ColorRestorationUNet(**checkpoint["model_config"]).to(resolved_device)
+    model_config = normalize_color_model_config(checkpoint["model_config"])
+    model = ColorRestorationUNet(**model_config).to(resolved_device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
     return model, checkpoint, resolved_device
 
 
-def _model_rgb_output(model: ColorRestorationUNet, input_tensor: torch.Tensor) -> torch.Tensor:
+def model_rgb_output(model: ColorRestorationUNet, input_tensor: torch.Tensor) -> torch.Tensor:
     prediction = model(input_tensor)
     if model.mode == "lab_ab":
         return reconstruct_lab_ab(input_tensor, prediction)
+    if model.mode == "lab_residual":
+        return reconstruct_lab_residual(
+            input_tensor,
+            prediction,
+            max_l_shift=model.lab_l_shift,
+            max_ab_shift=model.lab_ab_shift,
+        )
     return prediction
 
 
@@ -108,7 +116,7 @@ def tiled_color_inference(
                 [input_tensor[:, :, top : top + tile_size, left : left + tile_size] for top, left in batch_positions],
                 dim=0,
             ).to(device)
-            predictions = _model_rgb_output(model, patches).detach().cpu()
+            predictions = model_rgb_output(model, patches).detach().cpu()
             for prediction, (top, left) in zip(predictions, batch_positions):
                 accumulator[:, :, top : top + tile_size, left : left + tile_size] += prediction.unsqueeze(0) * window
                 weights[:, :, top : top + tile_size, left : left + tile_size] += window
@@ -127,8 +135,15 @@ def run_color_restoration(
     tile_size: int = 256,
     overlap: int = 64,
     tile_batch_size: int = 4,
+    runtime_quality_mode: str | None = None,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     model, checkpoint, resolved_device = load_color_checkpoint(checkpoint_path, device=device)
+    trained_quality_mode = checkpoint.get("dataset_config", {}).get("quality_mode")
+    if runtime_quality_mode and trained_quality_mode and runtime_quality_mode != trained_quality_mode:
+        raise ValueError(
+            f"Color checkpoint expects quality_mode={trained_quality_mode!r}, "
+            f"but runtime uses {runtime_quality_mode!r}"
+        )
     restored = tiled_color_inference(
         image_rgb,
         model,
@@ -149,5 +164,9 @@ def run_color_restoration(
         "tile_size": tile_size,
         "overlap": overlap,
         "tile_batch_size": tile_batch_size,
-        "residual_scale": float(model.residual_scale.detach().cpu()),
+        "trained_quality_mode": trained_quality_mode,
+        "runtime_quality_mode": runtime_quality_mode,
+        "residual_scale": float(model.residual_scale.detach().cpu()) if model.mode == "rgb_residual" else None,
+        "lab_l_shift": model.lab_l_shift if model.mode == "lab_residual" else None,
+        "lab_ab_shift": model.lab_ab_shift if model.mode == "lab_residual" else None,
     }

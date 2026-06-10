@@ -10,29 +10,50 @@ The target is always the original clean RGB crop. Color, saturation, tone, and
 luminance are never modified to create a softer target. Only paired geometric
 augmentation is allowed.
 
-OpenCV quality restoration is not part of the default training path. It remains
-available only as an explicit ablation through `--quality-mode opencv_conservative`.
+V2 trains on the same input profile used by the experimental post-pipeline:
+
+```text
+synthetic faded-color degradation -> OpenCV conservative cleanup -> color model
+```
+
+The V2 degradation profile preserves usable chroma. Near-grayscale inputs belong
+to a separate colorization problem and are not generated for this model.
 
 ## 1. Generate paired data
 
 ```powershell
 python scripts\generate_color_dataset.py `
   --clean-dir D:\datasets\clean_images `
-  --output-dir data\processed\ds-color-restoration-320-v001 `
+  --output-dir data\processed\ds-color-restoration-v2-320 `
+  --degradation-profile faded_color_v2 `
   --train-variants 3 `
   --eval-variants 1 `
-  --quality-mode off
+  --quality-mode opencv_conservative
 ```
 
-The generator audits source dimensions before splitting source IDs into
-train/val/test. Images smaller than `320px` on either side are skipped by
-default. Inspect `source_audit.csv`, `manifest.csv`, and
+Repeat `--clean-dir` to mix datasets without copying them into one directory:
+
+```bash
+python scripts/generate_color_dataset.py \
+  --clean-dir /kaggle/input/ffhq \
+  --clean-dir /kaggle/input/deepfashion-person-subset \
+  --clean-dir /kaggle/input/coco-person-subset \
+  --output-dir /kaggle/working/ds-color-v2-mixed \
+  --max-sources 15000 \
+  --degradation-profile faded_color_v2 \
+  --quality-mode opencv_conservative \
+  --overwrite
+```
+
+The generator audits source dimensions and mean Lab chroma before splitting
+source IDs into train/val/test. V2 defaults to rejecting clean sources with mean
+chroma below `4.0`. Inspect `source_audit.csv`, `manifest.csv`, and
 `previews/comparison_grid.png` before training.
 
-With `--quality-mode off`, each preview contains:
+Each V2 preview contains:
 
 ```text
-clean target | synthetic degraded model input
+clean target | synthetic degraded | model input after OpenCV conservative
 ```
 
 ## 2. Train
@@ -41,8 +62,8 @@ Run a one-batch contract check:
 
 ```powershell
 python scripts\train_restoration.py `
-  --config configs\color_restoration.yaml `
-  --run-id color-unet-lab-ab-r001-s42 `
+  --config configs\color_restoration_v2.yaml `
+  --run-id color-unet-lab-residual-v2-r001-s42 `
   --dry-run
 ```
 
@@ -50,19 +71,25 @@ Run the baseline:
 
 ```powershell
 python scripts\train_restoration.py `
-  --config configs\color_restoration.yaml `
-  --run-id color-unet-lab-ab-r001-s42
+  --config configs\color_restoration_v2.yaml `
+  --run-id color-unet-lab-residual-v2-r001-s42
 ```
 
-Lab-ab prediction is the default training mode. The model preserves the input
-Lab luminance channel and predicts the two chroma channels. RGB residual mode
-remains available through `--mode rgb_residual` only for compatibility and
-ablation.
+V2 predicts bounded Lab residuals:
+
+```text
+L output  = L input  + 15 * residual L
+ab output = ab input + 40 * residual ab
+```
+
+It uses GroupNorm for stable small-batch color training. Legacy `lab_ab` and
+`rgb_residual` checkpoints remain loadable.
 
 The default objective is:
 
 ```text
-L1 RGB + L1 Lab-ab + 0.2 SSIM + 0.1 Histogram EMD Lab-ab
+0.5 L1 RGB + 0.5 L1 Lab-L + L1 Lab-ab
++ 0.2 SSIM + 0.1 Histogram EMD Lab-ab + 0.2 identity preservation
 ```
 
 Histogram EMD compares the global predicted and target chroma distributions.
@@ -73,13 +100,13 @@ Kaggle-safe DataLoader workers.
 
 ```powershell
 python scripts\evaluate_color_restoration.py `
-  --checkpoint checkpoints\color_restoration\color-unet-lab-ab-r001-s42\best.pth `
-  --dataset-root data\processed\ds-color-restoration-320-v001 `
+  --checkpoint checkpoints\color_restoration\color-unet-lab-residual-v2-r001-s42\best.pth `
+  --dataset-root data\processed\ds-color-restoration-v2-320 `
   --output-dir outputs\color_eval
 
 python scripts\infer_color_restoration.py `
   --input outputs\lama_result.png `
-  --checkpoint checkpoints\color_restoration\color-unet-lab-ab-r001-s42\best.pth `
+  --checkpoint checkpoints\color_restoration\color-unet-lab-residual-v2-r001-s42\best.pth `
   --output outputs\color_restored.png
 ```
 
@@ -93,54 +120,56 @@ python scripts\run_restoration_pipeline.py `
   --checkpoint checkpoints\segmenter\seg-unet-attn-r013-gen120-fixed118-local\best_val_iou.pth `
   --backend official_lama `
   --post-pipeline pikfix_experimental `
-  --quality-mode off `
-  --color-checkpoint checkpoints\color_restoration\color-unet-lab-ab-r001-s42\best.pth `
+  --quality-mode opencv_conservative `
+  --color-checkpoint checkpoints\color_restoration\color-unet-lab-residual-v2-r001-s42\best.pth `
   --face-mode auto
 ```
 
-The full pipeline must use the same input profile used during training. A model
-trained with `--quality-mode off` should therefore be run with
+The full pipeline validates the checkpoint's training quality mode. A V2
+checkpoint trained after `opencv_conservative` is rejected if runtime uses
 `--quality-mode off`.
 
-## 5. Fine-tune for real yellow/sepia portraits
+## 5. Train V2 on color-preserving old-photo degradation
 
-Use 1,000 FFHQ sources and the heavy real-old-photo profile:
+Use 5,000 FFHQ sources for the first full V2 run:
 
 ```bash
 python scripts/generate_color_dataset.py \
   --clean-dir /kaggle/input/ffhq-dataset \
-  --output-dir /kaggle/working/ds-color-ffhq-heavy-1000 \
-  --max-sources 1000 \
-  --degradation-profile real_old_photo_heavy \
+  --output-dir /kaggle/working/ds-color-ffhq-v2-5000 \
+  --max-sources 5000 \
+  --degradation-profile faded_color_v2 \
   --crop-size 320 \
   --train-variants 3 \
   --eval-variants 1 \
-  --quality-mode off \
+  --quality-mode opencv_conservative \
   --num-previews 20 \
   --overwrite
 ```
 
-This profile produces four useful groups:
+This profile produces:
 
 ```text
-35% strong sepia
-30% warm near-grayscale
-25% faded old color
-10% mild or identity samples
+20% identity
+25% mild yellow/fading
+35% faded old color
+15% moderate sepia with retained chroma
+5% hard color degradation with retained chroma
 ```
 
-Every generated sample uses the unmodified clean FFHQ crop as its target,
-including strong sepia and warm near-grayscale inputs. Do not reuse datasets
-generated with the removed `conservative_real_old_photo` target profile.
+Every generated sample uses the unmodified clean FFHQ crop as its target. The
+V2 profile deliberately excludes near-grayscale degradation. Do not reuse
+datasets generated with `real_old_photo_heavy` or the removed
+`conservative_real_old_photo` target profile.
 
-Train a fresh Lab-ab run:
+Train a fresh Lab-residual run:
 
 ```bash
 python scripts/train_restoration.py \
-  --config configs/color_restoration.yaml \
-  --dataset-root /kaggle/working/ds-color-ffhq-heavy-1000 \
-  --run-id color-ffhq-lab-ab-heavy-r001 \
-  --mode lab_ab \
+  --config configs/color_restoration_v2.yaml \
+  --dataset-root /kaggle/working/ds-color-ffhq-v2-5000 \
+  --run-id color-ffhq-lab-residual-v2-r001 \
+  --mode lab_residual \
   --base-channels 32 \
   --epochs 30 \
   --batch-size 8 \
@@ -151,7 +180,7 @@ python scripts/train_restoration.py \
 Before training, inspect the preview carefully. Each row uses:
 
 ```text
-clean RGB target | old-photo synthetic input
+clean RGB target | synthetic degraded | input after OpenCV conservative
 ```
 
 Do not train if the target differs in color from the clean source, or if the

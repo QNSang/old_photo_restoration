@@ -97,6 +97,7 @@ def apply_pikfix_color_restoration(
     image_rgb: np.ndarray,
     checkpoint_path: Path | None = None,
     reference_path: Path | None = None,
+    runtime_quality_mode: str | None = None,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """Run the trained color model while preserving a safe pass-through contract."""
     image = _ensure_rgb_uint8(image_rgb)
@@ -124,7 +125,11 @@ def apply_pikfix_color_restoration(
             **base_metadata,
         }
     try:
-        restored, metadata = run_color_restoration(image, checkpoint_path)
+        restored, metadata = run_color_restoration(
+            image,
+            checkpoint_path,
+            runtime_quality_mode=runtime_quality_mode,
+        )
         return restored, {**base_metadata, **metadata}
     except Exception as exc:
         return image.copy(), {
@@ -218,7 +223,12 @@ def run_pikfix_post_pipeline(
     stage_outputs["quality_restored"] = str(quality_output)
 
     color_output = output_path / "color_restored.png"
-    current, info = apply_pikfix_color_restoration(current, checkpoint_path=color_checkpoint, reference_path=color_reference)
+    current, info = apply_pikfix_color_restoration(
+        current,
+        checkpoint_path=color_checkpoint,
+        reference_path=color_reference,
+        runtime_quality_mode=quality_mode,
+    )
     _save_rgb(color_output, current)
     stages.append(
         _stage(
@@ -231,7 +241,7 @@ def run_pikfix_post_pipeline(
         )
     )
     stage_outputs["color_restored"] = str(color_output)
-    if info["status"] == "failed" or info["reason"] not in {"checkpoint_not_configured"}:
+    if info["status"] == "failed":
         warnings.append(f"color_restoration: {info['reason']}")
 
     realesrgan_output = output_path / "realesrgan_restored.png"

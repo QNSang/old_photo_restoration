@@ -149,6 +149,8 @@ class ColorRestorationDataset(Dataset):
             "degraded": rgb_to_normalized_tensor(input_image),
             "clean": rgb_to_normalized_tensor(clean_image),
             "sample_id": row["sample_id"],
+            "degradation_subprofile": row.get("degradation_subprofile") or "unknown",
+            "identity_mask": torch.tensor(float(row.get("identity_sample") or 0.0), dtype=torch.float32),
         }
         if self.return_paths:
             result["input_path"] = str(input_path)

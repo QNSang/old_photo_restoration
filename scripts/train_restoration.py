@@ -22,15 +22,15 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.data.color_dataset import ColorRestorationDataset, validate_clean_target_contract
-from src.losses.color_restoration import ColorRestorationLoss, reconstruct_lab_ab
+from src.losses.color_restoration import ColorRestorationLoss, reconstruct_lab_ab, reconstruct_lab_residual
 from src.models.color_unet import ColorRestorationUNet, VALID_COLOR_MODEL_MODES
 from src.restoration.color_restoration import CHECKPOINT_FORMAT_VERSION, resolve_torch_device
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train Pik-Fix-inspired color restoration U-Net.")
-    parser.add_argument("--config", default="configs/color_restoration.yaml")
-    parser.add_argument("--run-id", default="color-unet-lab-ab-r001-s42")
+    parser.add_argument("--config", default="configs/color_restoration_v2.yaml")
+    parser.add_argument("--run-id", default="color-unet-lab-residual-v2-r001-s42")
     parser.add_argument("--mode", choices=sorted(VALID_COLOR_MODEL_MODES))
     parser.add_argument("--base-channels", type=int)
     parser.add_argument("--dataset-root")
@@ -95,10 +95,12 @@ def apply_dataset_metadata(config: dict[str, Any], dataset_root: Path) -> dict[s
 
 def normalize_loss_config(config: dict[str, Any]) -> dict[str, Any]:
     defaults = {
-        "rgb_weight": 1.0,
+        "rgb_weight": 0.5,
+        "l_weight": 0.5,
         "ab_weight": 1.0,
         "ssim_weight": 0.2,
         "hist_emd_weight": 0.1,
+        "identity_weight": 0.2,
         "hist_bins": 64,
         "hist_max_samples": 4096,
     }
@@ -141,7 +143,26 @@ def make_loader(dataset: ColorRestorationDataset, batch_size: int, num_workers: 
 
 def prediction_to_rgb(model: ColorRestorationUNet, inputs: torch.Tensor) -> torch.Tensor:
     prediction = model(inputs)
-    return reconstruct_lab_ab(inputs, prediction) if model.mode == "lab_ab" else prediction
+    if model.mode == "lab_ab":
+        return reconstruct_lab_ab(inputs, prediction)
+    if model.mode == "lab_residual":
+        return reconstruct_lab_residual(
+            inputs,
+            prediction,
+            max_l_shift=model.lab_l_shift,
+            max_ab_shift=model.lab_ab_shift,
+        )
+    return prediction
+
+
+def validate_required_quality_mode(config: dict[str, Any]) -> None:
+    required = config["dataset"].get("required_quality_mode")
+    actual = config["dataset"].get("quality_mode")
+    if required and actual != required:
+        raise ValueError(
+            f"Training config requires dataset quality_mode={required!r}, "
+            f"but dataset metadata reports {actual!r}"
+        )
 
 
 def tensor_to_rgb_uint8(tensor: torch.Tensor) -> np.ndarray:
@@ -181,12 +202,20 @@ def run_epoch(
     for batch in loader:
         inputs = batch["degraded"].to(device, non_blocking=True)
         targets = batch["clean"].to(device, non_blocking=True)
+        identity_mask = batch.get("identity_mask")
+        if identity_mask is not None:
+            identity_mask = identity_mask.to(device, non_blocking=True)
         if training:
             optimizer.zero_grad(set_to_none=True)
         with torch.set_grad_enabled(training):
             with torch.autocast(device_type=device.type, enabled=amp_enabled):
                 predictions = prediction_to_rgb(model, inputs)
-                losses = loss_fn(predictions, targets)
+                losses = loss_fn(
+                    predictions,
+                    targets,
+                    input_rgb_normalized=inputs,
+                    identity_mask=identity_mask,
+                )
             if training:
                 assert scaler is not None
                 scaler.scale(losses["total"]).backward()
@@ -229,7 +258,7 @@ def save_checkpoint(
             "dataset_id": dataset_id,
             "input_profile": config["dataset"].get("input_profile", ""),
             "early_stopping": early_stopping,
-            "residual_scale": float(model.residual_scale.detach().cpu()),
+            "residual_scale": float(model.residual_scale.detach().cpu()) if model.mode == "rgb_residual" else None,
         },
         path,
     )
@@ -269,6 +298,7 @@ def main() -> int:
     dataset_root = resolve_path(config["dataset"]["root"])
     validate_clean_target_contract(dataset_root)
     config = apply_dataset_metadata(config, dataset_root)
+    validate_required_quality_mode(config)
     model_config = dict(config["model"])
     training = config["training"]
     loss_config = config["loss"]
@@ -348,7 +378,12 @@ def main() -> int:
             "epochs_without_improvement": epochs_without_improvement,
             "triggered": epochs_without_improvement >= patience > 0,
         }
-        row = {"epoch": epoch, "lr": scheduler.get_last_lr()[0], "residual_scale": float(model.residual_scale.detach().cpu())}
+        row = {
+            "epoch": epoch,
+            "lr": scheduler.get_last_lr()[0],
+            "model_mode": model.mode,
+            "residual_scale": float(model.residual_scale.detach().cpu()) if model.mode == "rgb_residual" else None,
+        }
         row.update({f"train_{key}": value for key, value in train_metrics.items()})
         row.update({f"val_{key}": value for key, value in val_metrics.items()})
         row["improved"] = int(improved)
@@ -359,7 +394,10 @@ def main() -> int:
         save_checkpoint(checkpoint_root / "last.pth", epoch=epoch, model=model, optimizer=optimizer, scheduler=scheduler, scaler=scaler, metrics=row, config=config, dataset_id=dataset_id, early_stopping=early_stopping)
         if improved:
             save_checkpoint(checkpoint_root / "best.pth", epoch=epoch, model=model, optimizer=optimizer, scheduler=scheduler, scaler=scaler, metrics=row, config=config, dataset_id=dataset_id, early_stopping=early_stopping)
-        print(f"epoch={epoch} train_total={train_metrics['total']:.6f} val_total={val_metrics['total']:.6f} scale={row['residual_scale']:.4f} improved={improved}")
+        print(
+            f"epoch={epoch} mode={model.mode} train_total={train_metrics['total']:.6f} "
+            f"val_total={val_metrics['total']:.6f} improved={improved}"
+        )
         if early_stopping["triggered"]:
             print(f"early_stopping: epoch={epoch} best_val_loss={best_val:.6f}")
             break

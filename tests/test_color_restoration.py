@@ -11,17 +11,23 @@ import torch
 
 from scripts.generate_color_dataset import (
     audit_sources,
+    list_sources,
     main as generate_dataset_main,
     prepare_clean_crop,
     prepare_model_input,
     select_source_subset,
     split_sources,
 )
-from scripts.train_restoration import resolve_num_workers, run_epoch, save_checkpoint
+from scripts.train_restoration import resolve_num_workers, run_epoch, save_checkpoint, validate_required_quality_mode
 from src.data.color_degradation import ColorDegradationConfig, DegradationSimulator
 from src.data.color_dataset import validate_clean_target_contract
 from src.models.color_unet import ColorRestorationUNet
-from src.restoration.color_restoration import CHECKPOINT_FORMAT_VERSION, run_color_restoration, tiled_color_inference
+from src.restoration.color_restoration import (
+    CHECKPOINT_FORMAT_VERSION,
+    load_color_checkpoint,
+    run_color_restoration,
+    tiled_color_inference,
+)
 from src.restoration.post_restoration import run_pikfix_post_pipeline
 
 
@@ -73,6 +79,32 @@ def test_real_old_photo_heavy_profile_is_deterministic_and_uses_named_subprofile
     assert "color_cast" not in first_metadata["applied"]
 
 
+def test_faded_color_v2_is_deterministic_and_never_uses_near_grayscale_profile() -> None:
+    image = np.dstack(
+        [
+            np.full((64, 64), 70, dtype=np.uint8),
+            np.full((64, 64), 145, dtype=np.uint8),
+            np.full((64, 64), 210, dtype=np.uint8),
+        ]
+    )
+    simulator = DegradationSimulator(profile="faded_color_v2")
+
+    first, first_metadata = simulator.apply(image, seed=9, return_metadata=True)
+    second, second_metadata = simulator.apply(image, seed=9, return_metadata=True)
+
+    assert np.array_equal(first, second)
+    assert first_metadata == second_metadata
+    assert first_metadata["subprofile"] in {
+        "identity",
+        "mild_yellow_fading",
+        "faded_old_color",
+        "moderate_sepia",
+        "hard_color_degradation",
+    }
+    assert first_metadata["degraded_mean_chroma"] > 0
+    assert first_metadata["chroma_retention"] > 0
+
+
 def test_color_only_model_input_skips_quality_restoration() -> None:
     degraded = np.full((32, 40, 3), [130, 110, 80], dtype=np.uint8)
     model_input, metadata = prepare_model_input(degraded, "off")
@@ -109,6 +141,22 @@ def test_select_source_subset_is_deterministic() -> None:
     assert len(first) == 10
 
 
+def test_list_sources_accepts_multiple_clean_roots(tmp_path: Path) -> None:
+    import cv2
+
+    first_root = tmp_path / "ffhq"
+    second_root = tmp_path / "fashion"
+    first_root.mkdir()
+    second_root.mkdir()
+    cv2.imwrite(str(first_root / "face.png"), np.zeros((16, 16, 3), dtype=np.uint8))
+    cv2.imwrite(str(second_root / "clothes.jpg"), np.zeros((16, 16, 3), dtype=np.uint8))
+
+    sources = list_sources([first_root, second_root])
+
+    assert len(sources) == 2
+    assert set(sources) == {first_root / "face.png", second_root / "clothes.jpg"}
+
+
 def test_dataset_generator_writes_manifest_audit_and_comparison_grid(tmp_path: Path, monkeypatch) -> None:
     import cv2
 
@@ -116,7 +164,8 @@ def test_dataset_generator_writes_manifest_audit_and_comparison_grid(tmp_path: P
     output_root = tmp_path / "dataset"
     clean_root.mkdir()
     for index in range(3):
-        cv2.imwrite(str(clean_root / f"source_{index}.png"), np.full((48, 48, 3), 70 + index * 30, dtype=np.uint8))
+        image = np.full((48, 48, 3), [40 + index * 10, 100, 190 - index * 10], dtype=np.uint8)
+        cv2.imwrite(str(clean_root / f"source_{index}.png"), image)
     monkeypatch.setattr(
         "sys.argv",
         [
@@ -127,7 +176,8 @@ def test_dataset_generator_writes_manifest_audit_and_comparison_grid(tmp_path: P
             "--train-variants", "1",
             "--eval-variants", "1",
             "--max-sources", "3",
-            "--degradation-profile", "real_old_photo_heavy",
+            "--degradation-profile", "faded_color_v2",
+            "--quality-mode", "opencv_conservative",
             "--num-previews", "2",
         ],
     )
@@ -140,16 +190,19 @@ def test_dataset_generator_writes_manifest_audit_and_comparison_grid(tmp_path: P
     assert (output_root / "source_audit.csv").exists()
     assert (output_root / "previews" / "comparison_grid.png").exists()
     metadata = json.loads((output_root / "dataset_metadata.json").read_text(encoding="utf-8"))
-    assert metadata["quality_mode"] == "off"
-    assert metadata["input_profile"] == "synthetic_real_old_photo_heavy_direct"
+    assert metadata["quality_mode"] == "opencv_conservative"
+    assert metadata["input_profile"] == "synthetic_faded_color_v2_after_opencv_conservative"
     assert metadata["training_objective"] == "clean_rgb_color_restoration"
-    assert metadata["degradation_profile"] == "real_old_photo_heavy"
+    assert metadata["degradation_profile"] == "faded_color_v2"
+    assert metadata["min_source_chroma"] == 4.0
     assert metadata["target_profile"] == "clean_rgb"
     assert metadata["target_transform"] == "clean_crop_only"
     assert metadata["selected_sources"] == 3
     assert all(row["target_path"] == row["clean_path"] for row in rows)
     assert all(row["target_profile"] == "clean_rgb" for row in rows)
     assert all(row["target_transform"] == "clean_crop_only" for row in rows)
+    assert all(row["degradation_subprofile"] for row in rows)
+    assert all(row["input_mean_chroma"] for row in rows)
     for row in rows:
         source_bgr = cv2.imread(row["source_path"], cv2.IMREAD_COLOR)
         source_rgb = cv2.cvtColor(source_bgr, cv2.COLOR_BGR2RGB)
@@ -189,11 +242,26 @@ def test_rgb_residual_model_has_bounded_learnable_scale_and_backward() -> None:
     assert model.residual_scale_raw.grad is not None
 
 
-def test_lab_ab_is_default_model_mode() -> None:
+def test_lab_residual_is_default_model_mode_with_group_norm() -> None:
     model = ColorRestorationUNet(base_channels=4)
 
-    assert model.mode == "lab_ab"
-    assert model(torch.zeros(1, 3, 32, 32)).shape == (1, 2, 32, 32)
+    assert model.mode == "lab_residual"
+    assert model.normalization == "group"
+    assert model(torch.zeros(1, 3, 32, 32)).shape == (1, 3, 32, 32)
+
+
+def test_lab_residual_zero_prediction_preserves_input_and_has_bounded_change() -> None:
+    pytest.importorskip("kornia")
+    from src.losses.color_restoration import reconstruct_lab_residual
+
+    inputs = torch.rand(1, 3, 32, 32) * 1.6 - 0.8
+    unchanged = reconstruct_lab_residual(inputs, torch.zeros(1, 3, 32, 32))
+    changed = reconstruct_lab_residual(inputs, torch.ones(1, 3, 32, 32), max_l_shift=15, max_ab_shift=40)
+
+    assert torch.allclose(unchanged, inputs, atol=2e-3)
+    assert changed.shape == inputs.shape
+    assert float(changed.min()) >= -1.0
+    assert float(changed.max()) <= 1.0
 
 
 def test_lab_ab_model_and_unified_loss() -> None:
@@ -205,13 +273,14 @@ def test_lab_ab_model_and_unified_loss() -> None:
     targets = torch.rand(2, 3, 32, 32) * 2 - 1
     predicted_ab = model(inputs)
     predicted_rgb = reconstruct_lab_ab(inputs, predicted_ab)
-    losses = ColorRestorationLoss()(predicted_rgb, targets)
+    losses = ColorRestorationLoss()(predicted_rgb, targets, input_rgb_normalized=inputs, identity_mask=torch.ones(2))
     losses["total"].backward()
 
     assert predicted_ab.shape == (2, 2, 32, 32)
     assert predicted_rgb.shape == inputs.shape
-    assert set(losses) == {"total", "rgb_l1", "ab_l1", "ssim", "hist_emd"}
+    assert set(losses) == {"total", "rgb_l1", "l_l1", "ab_l1", "ssim", "hist_emd", "identity"}
     assert torch.isfinite(losses["hist_emd"])
+    assert float(losses["identity"]) > 0
 
 
 def test_lab_ab_histogram_emd_detects_color_shift_and_has_gradient() -> None:
@@ -237,7 +306,7 @@ def test_training_smoke_reports_hist_emd_and_checkpoint_saves_loss_config(tmp_pa
     pytest.importorskip("kornia")
     from src.losses.color_restoration import ColorRestorationLoss
 
-    model = ColorRestorationUNet(mode="lab_ab", base_channels=2)
+    model = ColorRestorationUNet(mode="lab_residual", base_channels=2)
     loss_fn = ColorRestorationLoss(hist_bins=16, hist_max_samples=128)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=1)
@@ -245,6 +314,7 @@ def test_training_smoke_reports_hist_emd_and_checkpoint_saves_loss_config(tmp_pa
     batch = {
         "degraded": torch.rand(2, 3, 32, 32) * 2 - 1,
         "clean": torch.rand(2, 3, 32, 32) * 2 - 1,
+        "identity_mask": torch.tensor([1.0, 0.0]),
     }
     metrics, _ = run_epoch(
         model,
@@ -275,12 +345,15 @@ def test_training_smoke_reports_hist_emd_and_checkpoint_saves_loss_config(tmp_pa
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
     assert "hist_emd" in metrics
+    assert "l_l1" in metrics
+    assert "identity" in metrics
     assert checkpoint["loss_config"] == loss_fn.get_config()
 
 
+@pytest.mark.parametrize("mode", ["rgb_residual", "lab_residual"])
 @pytest.mark.parametrize("height,width", [(256, 256), (1200, 800), (1201, 803), (173, 221)])
-def test_tiled_inference_preserves_exact_size(height: int, width: int) -> None:
-    model = ColorRestorationUNet(mode="rgb_residual", base_channels=1).eval()
+def test_tiled_inference_preserves_exact_size(mode: str, height: int, width: int) -> None:
+    model = ColorRestorationUNet(mode=mode, base_channels=1).eval()
     image = np.full((height, width, 3), 128, dtype=np.uint8)
     output = tiled_color_inference(image, model, torch.device("cpu"), tile_size=256, overlap=64, tile_batch_size=8)
 
@@ -289,7 +362,7 @@ def test_tiled_inference_preserves_exact_size(height: int, width: int) -> None:
 
 
 def test_checkpoint_inference_and_experimental_pipeline_apply_color_stage(tmp_path: Path) -> None:
-    model = ColorRestorationUNet(mode="rgb_residual", base_channels=2)
+    model = ColorRestorationUNet(mode="lab_residual", base_channels=2)
     checkpoint = tmp_path / "color.pth"
     torch.save(
         {
@@ -297,6 +370,7 @@ def test_checkpoint_inference_and_experimental_pipeline_apply_color_stage(tmp_pa
             "model_state_dict": model.state_dict(),
             "model_config": model.get_config(),
             "training_config": {},
+            "dataset_config": {"quality_mode": "off"},
         },
         checkpoint,
     )
@@ -313,12 +387,68 @@ def test_checkpoint_inference_and_experimental_pipeline_apply_color_stage(tmp_pa
     )
 
     assert inferred.shape == image.shape
-    assert metadata["model_mode"] == "rgb_residual"
+    assert metadata["model_mode"] == "lab_residual"
     assert restored.shape == image.shape
     assert pipeline_metadata["color_restoration_applied"] is True
+
+
+def test_v1_batchnorm_checkpoint_remains_loadable(tmp_path: Path) -> None:
+    model = ColorRestorationUNet(mode="lab_ab", base_channels=2, normalization="batch")
+    legacy_config = model.get_config()
+    legacy_config.pop("normalization")
+    legacy_config.pop("lab_l_shift")
+    legacy_config.pop("lab_ab_shift")
+    checkpoint = tmp_path / "legacy_v1.pth"
+    torch.save(
+        {
+            "checkpoint_format_version": 1,
+            "model_state_dict": model.state_dict(),
+            "model_config": legacy_config,
+        },
+        checkpoint,
+    )
+
+    loaded, _, _ = load_color_checkpoint(checkpoint, device="cpu")
+
+    assert loaded.mode == "lab_ab"
+    assert loaded.normalization == "batch"
+
+
+def test_runtime_quality_mode_mismatch_is_rejected(tmp_path: Path) -> None:
+    model = ColorRestorationUNet(mode="lab_residual", base_channels=2)
+    checkpoint = tmp_path / "color_v2.pth"
+    torch.save(
+        {
+            "checkpoint_format_version": CHECKPOINT_FORMAT_VERSION,
+            "model_state_dict": model.state_dict(),
+            "model_config": model.get_config(),
+            "dataset_config": {"quality_mode": "opencv_conservative"},
+        },
+        checkpoint,
+    )
+
+    with pytest.raises(ValueError, match="expects quality_mode"):
+        run_color_restoration(
+            np.full((32, 32, 3), 128, dtype=np.uint8),
+            checkpoint,
+            device="cpu",
+            runtime_quality_mode="off",
+        )
 
 
 def test_kaggle_safe_worker_contract(monkeypatch) -> None:
     monkeypatch.setenv("KAGGLE_KERNEL_RUN_TYPE", "Interactive")
     assert resolve_num_workers("auto") == 0
     assert resolve_num_workers(2) == 2
+
+
+def test_v2_training_rejects_wrong_quality_mode() -> None:
+    config = {
+        "dataset": {
+            "required_quality_mode": "opencv_conservative",
+            "quality_mode": "off",
+        }
+    }
+
+    with pytest.raises(ValueError, match="requires dataset quality_mode"):
+        validate_required_quality_mode(config)
