@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import random
 from pathlib import Path
 from typing import Any
@@ -54,6 +55,58 @@ def rgb_to_normalized_tensor(image: np.ndarray) -> torch.Tensor:
     return tensor
 
 
+def validate_clean_target_contract(dataset_root: str | Path) -> dict[str, Any]:
+    root = Path(dataset_root)
+    metadata_path = root / "dataset_metadata.json"
+    if not metadata_path.exists():
+        raise FileNotFoundError(f"Missing color dataset metadata: {metadata_path}")
+    metadata: dict[str, Any] = json.loads(metadata_path.read_text(encoding="utf-8"))
+    target_profile = metadata.get("target_profile")
+    if target_profile != "clean_rgb":
+        raise ValueError(
+            f"Color dataset targets must be original clean RGB crops; "
+            f"found target_profile={target_profile!r} in {metadata_path}"
+        )
+    target_transform = metadata.get("target_transform")
+    if target_transform != "clean_crop_only":
+        raise ValueError(
+            f"Color dataset targets must use target_transform='clean_crop_only'; "
+            f"found {target_transform!r} in {metadata_path}"
+        )
+
+    manifest_path = root / "manifest.csv"
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"Missing color dataset manifest: {manifest_path}")
+    with manifest_path.open("r", encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    if not rows:
+        raise ValueError(f"Color dataset manifest is empty: {manifest_path}")
+    for row in rows:
+        target_profile = row.get("target_profile")
+        if target_profile != "clean_rgb":
+            raise ValueError(
+                f"Color dataset sample {row.get('sample_id')!r} has unsupported "
+                f"target_profile={target_profile!r}; regenerate with clean RGB targets"
+            )
+        target_transform = row.get("target_transform")
+        if target_transform != "clean_crop_only":
+            raise ValueError(
+                f"Color dataset sample {row.get('sample_id')!r} has unsupported "
+                f"target_transform={target_transform!r}"
+            )
+        if not row.get("target_path") or not row.get("clean_path"):
+            raise ValueError(
+                f"Color dataset sample {row.get('sample_id')!r} must define both "
+                "target_path and clean_path"
+            )
+        if row["target_path"] != row["clean_path"]:
+            raise ValueError(
+                f"Color dataset sample {row.get('sample_id')!r} must use the same "
+                "file for target_path and clean_path"
+            )
+    return metadata
+
+
 class ColorRestorationDataset(Dataset):
     def __init__(
         self,
@@ -70,9 +123,8 @@ class ColorRestorationDataset(Dataset):
         self.return_paths = return_paths
         if split not in {"train", "val", "test"}:
             raise ValueError(f"Unsupported split: {split}")
+        validate_clean_target_contract(self.dataset_root)
         manifest_path = self.dataset_root / "manifest.csv"
-        if not manifest_path.exists():
-            raise FileNotFoundError(f"Missing color dataset manifest: {manifest_path}")
         with manifest_path.open("r", encoding="utf-8", newline="") as handle:
             self.samples = [row for row in csv.DictReader(handle) if row.get("split") == split]
         if not self.samples:
@@ -84,7 +136,7 @@ class ColorRestorationDataset(Dataset):
     def __getitem__(self, index: int) -> dict[str, Any]:
         row = self.samples[index]
         input_path = self.dataset_root / row["input_path"]
-        clean_path = self.dataset_root / (row.get("target_path") or row["clean_path"])
+        clean_path = self.dataset_root / row["target_path"]
         input_image, clean_image = _paired_crop(
             _load_rgb(input_path),
             _load_rgb(clean_path),

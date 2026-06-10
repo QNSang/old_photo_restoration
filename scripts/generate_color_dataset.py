@@ -24,7 +24,8 @@ from src.restoration.post_restoration import apply_quality_restoration
 
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
-VALID_TARGET_PROFILES = {"clean_rgb", "conservative_real_old_photo"}
+TARGET_PROFILE = "clean_rgb"
+TARGET_TRANSFORM = "clean_crop_only"
 
 
 def parse_args() -> argparse.Namespace:
@@ -38,9 +39,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--degradation-profile", choices=sorted(VALID_DEGRADATION_PROFILES), default="balanced")
     parser.add_argument(
         "--target-profile",
-        choices=sorted(VALID_TARGET_PROFILES),
-        default="clean_rgb",
-        help="Use conservative targets for near-grayscale old photos to avoid forced creative colorization.",
+        choices=[TARGET_PROFILE],
+        default=TARGET_PROFILE,
+        help="Training targets are always the original clean RGB crop.",
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--allow-upscale-small", action="store_true")
@@ -169,58 +170,15 @@ def prepare_model_input(degraded: np.ndarray, quality_mode: str) -> tuple[np.nda
     return apply_quality_restoration(degraded, mode=quality_mode)
 
 
-def scale_saturation(image: np.ndarray, saturation_scale: float) -> np.ndarray:
-    hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV).astype(np.float32)
-    hsv[:, :, 1] = np.clip(hsv[:, :, 1] * saturation_scale, 0, 255)
-    return cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
-
-
-def prepare_training_target(
-    clean: np.ndarray,
-    degradation_metadata: dict[str, Any],
-    target_profile: str,
-    seed: int,
-) -> tuple[np.ndarray, dict[str, Any]]:
-    if target_profile == "clean_rgb":
-        return clean.copy(), {
-            "profile": target_profile,
-            "reason": "full_clean_rgb_target",
-            "saturation_scale": 1.0,
-        }
-    if target_profile != "conservative_real_old_photo":
-        raise ValueError(f"Unsupported target profile: {target_profile}")
-
-    subprofile = str(degradation_metadata.get("subprofile") or "faded_old_color")
-    saturation_ranges = {
-        "strong_sepia": (0.45, 0.70),
-        "warm_near_grayscale": (0.08, 0.25),
-        "faded_old_color": (0.72, 0.95),
-        "mild_degradation": (0.92, 1.0),
-        "identity": (1.0, 1.0),
-    }
-    low, high = saturation_ranges.get(subprofile, (0.65, 0.90))
-    saturation_scale = random.Random(seed ^ 0x51A7).uniform(low, high)
-    return scale_saturation(clean, saturation_scale), {
-        "profile": target_profile,
-        "reason": "saturation_matched_to_information_remaining",
-        "source_subprofile": subprofile,
-        "saturation_scale": saturation_scale,
-    }
-
-
 def make_preview(
     clean: np.ndarray,
     degraded: np.ndarray,
     model_input: np.ndarray,
-    target: np.ndarray,
     quality_mode: str,
-    target_profile: str,
 ) -> np.ndarray:
     panels = [clean, degraded]
     if quality_mode != "off":
         panels.append(model_input)
-    if target_profile != "clean_rgb":
-        panels.append(target)
     return np.concatenate(panels, axis=1)
 
 
@@ -272,12 +230,12 @@ def main() -> int:
                 clean = prepare_clean_crop(source_image, args.crop_size, sample_rng, args.allow_upscale_small)
                 degraded, degradation_metadata = simulator.apply(clean, seed=sample_seed, return_metadata=True)
                 model_input, quality_metadata = prepare_model_input(degraded, args.quality_mode)
-                target, target_metadata = prepare_training_target(
-                    clean,
-                    degradation_metadata,
-                    args.target_profile,
-                    sample_seed,
-                )
+                target = clean.copy()
+                target_metadata = {
+                    "profile": TARGET_PROFILE,
+                    "transform": TARGET_TRANSFORM,
+                    "reason": "original_clean_rgb_crop",
+                }
                 sample_id = f"{source_row['source_id']}-v{variant + 1:02d}"
                 input_path = output_root / split / "input" / f"{sample_id}.png"
                 target_path = output_root / split / "target" / f"{sample_id}.png"
@@ -301,7 +259,8 @@ def main() -> int:
                         "crop_size": args.crop_size,
                         "quality_mode": args.quality_mode,
                         "degradation_profile": args.degradation_profile,
-                        "target_profile": args.target_profile,
+                        "target_profile": TARGET_PROFILE,
+                        "target_transform": TARGET_TRANSFORM,
                         "quality_metadata": json.dumps(quality_metadata, sort_keys=True),
                         "degradation_metadata": json.dumps(degradation_metadata, sort_keys=True),
                         "target_metadata": json.dumps(target_metadata, sort_keys=True),
@@ -313,16 +272,14 @@ def main() -> int:
                             clean,
                             degraded,
                             model_input,
-                            target,
                             args.quality_mode,
-                            args.target_profile,
                         )
                     )
 
     manifest_fields = [
         "sample_id", "source_id", "source_path", "split", "variant", "seed", "input_path", "target_path", "clean_path",
         "raw_degraded_path", "crop_size", "quality_mode", "degradation_profile", "target_profile",
-        "quality_metadata", "degradation_metadata", "target_metadata",
+        "target_transform", "quality_metadata", "degradation_metadata", "target_metadata",
     ]
     write_csv(output_root / "manifest.csv", manifest, manifest_fields)
     previews_dir = output_root / "previews"
@@ -350,23 +307,16 @@ def main() -> int:
         "save_raw_degraded": args.save_raw_degraded,
         "quality_mode": args.quality_mode,
         "degradation_profile": args.degradation_profile,
-        "target_profile": args.target_profile,
+        "target_profile": TARGET_PROFILE,
+        "target_transform": TARGET_TRANSFORM,
         "input_profile": (
             f"synthetic_{args.degradation_profile}_direct"
             if args.quality_mode == "off"
             else f"synthetic_{args.degradation_profile}_after_{args.quality_mode}"
         ),
-        "training_objective": (
-            "conservative_color_restoration"
-            if args.target_profile == "conservative_real_old_photo"
-            else "color_restoration_only"
-        ),
+        "training_objective": "clean_rgb_color_restoration",
         "preview_panels": (
-            ["clean_source", "synthetic_degraded_input", "conservative_target"]
-            if args.target_profile == "conservative_real_old_photo" and args.quality_mode == "off"
-            else ["clean_source", "synthetic_degraded", "model_input_after_quality_stage", "conservative_target"]
-            if args.target_profile == "conservative_real_old_photo"
-            else ["clean_target", "synthetic_degraded_input"]
+            ["clean_target", "synthetic_degraded_input"]
             if args.quality_mode == "off"
             else ["clean_target", "synthetic_degraded", "model_input_after_quality_stage"]
         ),

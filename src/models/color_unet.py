@@ -43,7 +43,7 @@ class ColorUpBlock(nn.Module):
 class ColorRestorationUNet(nn.Module):
     def __init__(
         self,
-        mode: str = "rgb_residual",
+        mode: str = "lab_ab",
         base_channels: int = 64,
         residual_scale_init: float = 0.5,
         residual_scale_min: float = 0.1,

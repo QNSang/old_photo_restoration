@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import random
 from pathlib import Path
 
 import numpy as np
@@ -11,13 +12,14 @@ import torch
 from scripts.generate_color_dataset import (
     audit_sources,
     main as generate_dataset_main,
+    prepare_clean_crop,
     prepare_model_input,
-    prepare_training_target,
     select_source_subset,
     split_sources,
 )
-from scripts.train_restoration import resolve_num_workers
+from scripts.train_restoration import resolve_num_workers, run_epoch, save_checkpoint
 from src.data.color_degradation import ColorDegradationConfig, DegradationSimulator
+from src.data.color_dataset import validate_clean_target_contract
 from src.models.color_unet import ColorRestorationUNet
 from src.restoration.color_restoration import CHECKPOINT_FORMAT_VERSION, run_color_restoration, tiled_color_inference
 from src.restoration.post_restoration import run_pikfix_post_pipeline
@@ -69,24 +71,6 @@ def test_real_old_photo_heavy_profile_is_deterministic_and_uses_named_subprofile
         "identity",
     }
     assert "color_cast" not in first_metadata["applied"]
-
-
-def test_conservative_target_reduces_saturation_for_near_grayscale_input() -> None:
-    import cv2
-
-    clean = np.full((48, 48, 3), [210, 70, 45], dtype=np.uint8)
-    target, metadata = prepare_training_target(
-        clean,
-        {"subprofile": "warm_near_grayscale"},
-        "conservative_real_old_photo",
-        seed=42,
-    )
-    clean_saturation = float(cv2.cvtColor(clean, cv2.COLOR_RGB2HSV)[:, :, 1].mean())
-    target_saturation = float(cv2.cvtColor(target, cv2.COLOR_RGB2HSV)[:, :, 1].mean())
-
-    assert target_saturation < clean_saturation * 0.30
-    assert metadata["source_subprofile"] == "warm_near_grayscale"
-    assert 0.08 <= metadata["saturation_scale"] <= 0.25
 
 
 def test_color_only_model_input_skips_quality_restoration() -> None:
@@ -144,7 +128,6 @@ def test_dataset_generator_writes_manifest_audit_and_comparison_grid(tmp_path: P
             "--eval-variants", "1",
             "--max-sources", "3",
             "--degradation-profile", "real_old_photo_heavy",
-            "--target-profile", "conservative_real_old_photo",
             "--num-previews", "2",
         ],
     )
@@ -159,11 +142,38 @@ def test_dataset_generator_writes_manifest_audit_and_comparison_grid(tmp_path: P
     metadata = json.loads((output_root / "dataset_metadata.json").read_text(encoding="utf-8"))
     assert metadata["quality_mode"] == "off"
     assert metadata["input_profile"] == "synthetic_real_old_photo_heavy_direct"
-    assert metadata["training_objective"] == "conservative_color_restoration"
+    assert metadata["training_objective"] == "clean_rgb_color_restoration"
     assert metadata["degradation_profile"] == "real_old_photo_heavy"
-    assert metadata["target_profile"] == "conservative_real_old_photo"
+    assert metadata["target_profile"] == "clean_rgb"
+    assert metadata["target_transform"] == "clean_crop_only"
     assert metadata["selected_sources"] == 3
-    assert all(row["target_path"] for row in rows)
+    assert all(row["target_path"] == row["clean_path"] for row in rows)
+    assert all(row["target_profile"] == "clean_rgb" for row in rows)
+    assert all(row["target_transform"] == "clean_crop_only" for row in rows)
+    for row in rows:
+        source_bgr = cv2.imread(row["source_path"], cv2.IMREAD_COLOR)
+        source_rgb = cv2.cvtColor(source_bgr, cv2.COLOR_BGR2RGB)
+        expected = prepare_clean_crop(source_rgb, 32, random.Random(int(row["seed"])), allow_upscale=False)
+        target_bgr = cv2.imread(str(output_root / row["target_path"]), cv2.IMREAD_COLOR)
+        target_rgb = cv2.cvtColor(target_bgr, cv2.COLOR_BGR2RGB)
+        assert np.array_equal(target_rgb, expected)
+
+
+def test_clean_target_contract_rejects_conservative_dataset(tmp_path: Path) -> None:
+    dataset_root = tmp_path / "dataset"
+    dataset_root.mkdir()
+    (dataset_root / "dataset_metadata.json").write_text(
+        json.dumps({"target_profile": "conservative_real_old_photo"}),
+        encoding="utf-8",
+    )
+    (dataset_root / "manifest.csv").write_text(
+        "sample_id,split,input_path,target_path,clean_path,target_profile\n"
+        "sample-1,train,input.png,target.png,target.png,conservative_real_old_photo\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="original clean RGB"):
+        validate_clean_target_contract(dataset_root)
 
 
 def test_rgb_residual_model_has_bounded_learnable_scale_and_backward() -> None:
@@ -177,6 +187,13 @@ def test_rgb_residual_model_has_bounded_learnable_scale_and_backward() -> None:
     assert float(outputs.max()) <= 1.0
     assert 0.1 <= float(model.residual_scale.detach()) <= 1.0
     assert model.residual_scale_raw.grad is not None
+
+
+def test_lab_ab_is_default_model_mode() -> None:
+    model = ColorRestorationUNet(base_channels=4)
+
+    assert model.mode == "lab_ab"
+    assert model(torch.zeros(1, 3, 32, 32)).shape == (1, 2, 32, 32)
 
 
 def test_lab_ab_model_and_unified_loss() -> None:
@@ -193,7 +210,72 @@ def test_lab_ab_model_and_unified_loss() -> None:
 
     assert predicted_ab.shape == (2, 2, 32, 32)
     assert predicted_rgb.shape == inputs.shape
-    assert set(losses) == {"total", "rgb_l1", "ab_l1", "ssim"}
+    assert set(losses) == {"total", "rgb_l1", "ab_l1", "ssim", "hist_emd"}
+    assert torch.isfinite(losses["hist_emd"])
+
+
+def test_lab_ab_histogram_emd_detects_color_shift_and_has_gradient() -> None:
+    pytest.importorskip("kornia")
+    from src.losses.color_restoration import lab_ab_histogram_emd
+
+    target = torch.full((1, 3, 24, 24), 0.5)
+    matching = lab_ab_histogram_emd(target, target, bins=32, max_samples=256)
+    shifted = target.clone()
+    shifted[:, 0] = 0.85
+    shifted = shifted.requires_grad_(True)
+    shifted_loss = lab_ab_histogram_emd(shifted, target, bins=32, max_samples=256)
+    shifted_loss.backward()
+
+    assert float(matching) < 1e-6
+    assert float(shifted_loss) > float(matching) + 1e-3
+    assert shifted.grad is not None
+    assert torch.isfinite(shifted.grad).all()
+    assert float(shifted.grad.abs().sum()) > 0
+
+
+def test_training_smoke_reports_hist_emd_and_checkpoint_saves_loss_config(tmp_path: Path) -> None:
+    pytest.importorskip("kornia")
+    from src.losses.color_restoration import ColorRestorationLoss
+
+    model = ColorRestorationUNet(mode="lab_ab", base_channels=2)
+    loss_fn = ColorRestorationLoss(hist_bins=16, hist_max_samples=128)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=1)
+    scaler = torch.amp.GradScaler("cuda", enabled=False)
+    batch = {
+        "degraded": torch.rand(2, 3, 32, 32) * 2 - 1,
+        "clean": torch.rand(2, 3, 32, 32) * 2 - 1,
+    }
+    metrics, _ = run_epoch(
+        model,
+        [batch],
+        loss_fn,
+        torch.device("cpu"),
+        optimizer=optimizer,
+        scaler=scaler,
+    )
+    checkpoint_path = tmp_path / "best.pth"
+    config = {
+        "dataset": {"image_size": 32, "target_profile": "clean_rgb"},
+        "training": {"epochs": 1},
+        "loss": loss_fn.get_config(),
+    }
+    save_checkpoint(
+        checkpoint_path,
+        epoch=1,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        scaler=scaler,
+        metrics=metrics,
+        config=config,
+        dataset_id="test-clean-rgb",
+        early_stopping={},
+    )
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+
+    assert "hist_emd" in metrics
+    assert checkpoint["loss_config"] == loss_fn.get_config()
 
 
 @pytest.mark.parametrize("height,width", [(256, 256), (1200, 800), (1201, 803), (173, 221)])

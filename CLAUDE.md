@@ -1,7 +1,7 @@
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **old_photo_restoration_2** (4501 symbols, 6618 relationships, 137 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **old_photo_restoration** (5251 symbols, 7861 relationships, 161 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
 
@@ -24,10 +24,10 @@ This project is indexed by GitNexus as **old_photo_restoration_2** (4501 symbols
 
 | Resource | Use for |
 |----------|---------|
-| `gitnexus://repo/old_photo_restoration_2/context` | Codebase overview, check index freshness |
-| `gitnexus://repo/old_photo_restoration_2/clusters` | All functional areas |
-| `gitnexus://repo/old_photo_restoration_2/processes` | All execution flows |
-| `gitnexus://repo/old_photo_restoration_2/process/{name}` | Step-by-step execution trace |
+| `gitnexus://repo/old_photo_restoration/context` | Codebase overview, check index freshness |
+| `gitnexus://repo/old_photo_restoration/clusters` | All functional areas |
+| `gitnexus://repo/old_photo_restoration/processes` | All execution flows |
+| `gitnexus://repo/old_photo_restoration/process/{name}` | Step-by-step execution trace |
 
 ## CLI
 

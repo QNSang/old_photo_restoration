@@ -4,7 +4,7 @@ dataset:
   input_profile: synthetic_degraded_direct
 
 model:
-  mode: rgb_residual
+  mode: lab_ab
   base_channels: 64
   residual_scale_init: 0.5
   residual_scale_min: 0.1
@@ -14,6 +14,9 @@ loss:
   rgb_weight: 1.0
   ab_weight: 1.0
   ssim_weight: 0.2
+  hist_emd_weight: 0.1
+  hist_bins: 64
+  hist_max_samples: 4096
 
 training:
   epochs: 50

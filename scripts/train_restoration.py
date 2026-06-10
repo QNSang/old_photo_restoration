@@ -21,7 +21,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.data.color_dataset import ColorRestorationDataset
+from src.data.color_dataset import ColorRestorationDataset, validate_clean_target_contract
 from src.losses.color_restoration import ColorRestorationLoss, reconstruct_lab_ab
 from src.models.color_unet import ColorRestorationUNet, VALID_COLOR_MODEL_MODES
 from src.restoration.color_restoration import CHECKPOINT_FORMAT_VERSION, resolve_torch_device
@@ -30,7 +30,7 @@ from src.restoration.color_restoration import CHECKPOINT_FORMAT_VERSION, resolve
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train Pik-Fix-inspired color restoration U-Net.")
     parser.add_argument("--config", default="configs/color_restoration.yaml")
-    parser.add_argument("--run-id", default="color-unet-rgb-r001-s42")
+    parser.add_argument("--run-id", default="color-unet-lab-ab-r001-s42")
     parser.add_argument("--mode", choices=sorted(VALID_COLOR_MODEL_MODES))
     parser.add_argument("--base-channels", type=int)
     parser.add_argument("--dataset-root")
@@ -90,6 +90,20 @@ def apply_dataset_metadata(config: dict[str, Any], dataset_root: Path) -> dict[s
     config["dataset"]["degradation_profile"] = str(metadata.get("degradation_profile", "unknown"))
     config["dataset"]["target_profile"] = str(metadata.get("target_profile", "clean_rgb"))
     config["dataset"]["training_objective"] = str(metadata.get("training_objective", "color_restoration_only"))
+    return config
+
+
+def normalize_loss_config(config: dict[str, Any]) -> dict[str, Any]:
+    defaults = {
+        "rgb_weight": 1.0,
+        "ab_weight": 1.0,
+        "ssim_weight": 0.2,
+        "hist_emd_weight": 0.1,
+        "hist_bins": 64,
+        "hist_max_samples": 4096,
+    }
+    defaults.update(config.get("loss") or {})
+    config["loss"] = defaults
     return config
 
 
@@ -162,7 +176,7 @@ def run_epoch(
 ) -> tuple[dict[str, float], tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None]:
     training = optimizer is not None
     model.train(training)
-    sums = {"total": 0.0, "rgb_l1": 0.0, "ab_l1": 0.0, "ssim": 0.0}
+    sums: dict[str, float] = {}
     sample_batch = None
     for batch in loader:
         inputs = batch["degraded"].to(device, non_blocking=True)
@@ -178,8 +192,8 @@ def run_epoch(
                 scaler.scale(losses["total"]).backward()
                 scaler.step(optimizer)
                 scaler.update()
-        for name in sums:
-            sums[name] += float(losses[name].detach().cpu())
+        for name, value in losses.items():
+            sums[name] = sums.get(name, 0.0) + float(value.detach().cpu())
         if sample_batch is None:
             sample_batch = (inputs.detach().cpu(), predictions.detach().cpu(), targets.detach().cpu())
     return average_metrics(sums, len(loader)), sample_batch
@@ -211,6 +225,7 @@ def save_checkpoint(
             "model_config": model.get_config(),
             "dataset_config": config["dataset"],
             "training_config": config["training"],
+            "loss_config": config["loss"],
             "dataset_id": dataset_id,
             "input_profile": config["dataset"].get("input_profile", ""),
             "early_stopping": early_stopping,
@@ -250,8 +265,9 @@ def main() -> int:
     if args.resume and args.init_checkpoint:
         raise ValueError("Use only one of --resume or --init-checkpoint")
     config_path = resolve_path(args.config)
-    config = apply_overrides(load_config(config_path), args)
+    config = normalize_loss_config(apply_overrides(load_config(config_path), args))
     dataset_root = resolve_path(config["dataset"]["root"])
+    validate_clean_target_contract(dataset_root)
     config = apply_dataset_metadata(config, dataset_root)
     model_config = dict(config["model"])
     training = config["training"]
@@ -300,6 +316,8 @@ def main() -> int:
         resume_checkpoint = torch.load(resolve_path(args.resume), map_location=device, weights_only=False)
         if resume_checkpoint.get("model_config") != model.get_config():
             raise ValueError("Resume checkpoint model_config does not match the active training config")
+        if resume_checkpoint.get("loss_config") != loss_fn.get_config():
+            raise ValueError("Resume checkpoint loss_config does not match the active training config")
         model.load_state_dict(resume_checkpoint["model_state_dict"])
         optimizer.load_state_dict(resume_checkpoint["optimizer_state_dict"])
         scheduler.load_state_dict(resume_checkpoint["scheduler_state_dict"])
