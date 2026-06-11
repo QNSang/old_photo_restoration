@@ -150,17 +150,21 @@ python scripts/generate_color_dataset.py \
 This profile produces:
 
 ```text
-20% identity
-25% mild yellow/fading
-35% faded old color
-15% moderate sepia with retained chroma
-5% hard color degradation with retained chroma
+5% identity
+15% mild yellow/fading
+45% faded old color
+25% moderate sepia with retained chroma
+10% hard color degradation with retained chroma
 ```
 
 Every generated sample uses the unmodified clean FFHQ crop as its target. The
 V2 profile deliberately excludes near-grayscale degradation. Do not reuse
 datasets generated with `real_old_photo_heavy` or the removed
 `conservative_real_old_photo` target profile.
+
+All non-identity V2 samples receive a warm yellow paper cast. Faded, sepia, and
+hard-color samples use progressively stronger warm casts while retaining some
+random channel variation.
 
 Train a fresh Lab-residual run:
 

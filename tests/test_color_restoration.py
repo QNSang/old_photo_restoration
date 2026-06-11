@@ -105,6 +105,47 @@ def test_faded_color_v2_is_deterministic_and_never_uses_near_grayscale_profile()
     assert first_metadata["chroma_retention"] > 0
 
 
+def test_faded_color_v2_distribution_focuses_on_color_degradation() -> None:
+    image = np.dstack(
+        [
+            np.full((32, 32), 70, dtype=np.uint8),
+            np.full((32, 32), 145, dtype=np.uint8),
+            np.full((32, 32), 210, dtype=np.uint8),
+        ]
+    )
+    simulator = DegradationSimulator(profile="faded_color_v2")
+    counts: dict[str, int] = {}
+
+    for seed in range(400):
+        _, metadata = simulator.apply(image, seed=seed, return_metadata=True)
+        subprofile = str(metadata["subprofile"])
+        counts[subprofile] = counts.get(subprofile, 0) + 1
+
+    assert counts.get("identity", 0) <= 35
+    assert counts.get("faded_old_color", 0) >= 130
+    assert counts.get("moderate_sepia", 0) + counts.get("hard_color_degradation", 0) >= 110
+
+
+def test_faded_color_v2_non_identity_samples_have_strong_warm_bias() -> None:
+    image = np.dstack(
+        [
+            np.full((32, 32), 70, dtype=np.uint8),
+            np.full((32, 32), 145, dtype=np.uint8),
+            np.full((32, 32), 210, dtype=np.uint8),
+        ]
+    )
+    simulator = DegradationSimulator(profile="faded_color_v2")
+    warm_strengths = []
+
+    for seed in range(400):
+        _, metadata = simulator.apply(image, seed=seed, return_metadata=True)
+        if metadata["subprofile"] != "identity":
+            warm_strengths.append(float(metadata["applied"]["warm_paper"]))
+
+    assert min(warm_strengths) >= 0.08
+    assert float(np.mean(warm_strengths)) >= 0.17
+
+
 def test_color_only_model_input_skips_quality_restoration() -> None:
     degraded = np.full((32, 40, 3), [130, 110, 80], dtype=np.uint8)
     model_input, metadata = prepare_model_input(degraded, "off")

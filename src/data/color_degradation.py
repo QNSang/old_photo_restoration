@@ -321,13 +321,13 @@ class DegradationSimulator:
         np_rng: np.random.Generator,
     ) -> tuple[Array, dict[str, Any]]:
         draw = rng.random()
-        if draw < 0.20:
+        if draw < 0.05:
             subprofile = "identity"
-        elif draw < 0.45:
+        elif draw < 0.20:
             subprofile = "mild_yellow_fading"
-        elif draw < 0.80:
+        elif draw < 0.65:
             subprofile = "faded_old_color"
-        elif draw < 0.95:
+        elif draw < 0.90:
             subprofile = "moderate_sepia"
         else:
             subprofile = "hard_color_degradation"
@@ -336,29 +336,33 @@ class DegradationSimulator:
         applied: dict[str, Any] = {}
         if subprofile != "identity":
             if subprofile == "mild_yellow_fading":
-                fading_max = rng.uniform(0.10, 0.24)
-                warmth = rng.uniform(0.02, 0.07)
+                fading_max = rng.uniform(0.16, 0.32)
+                warmth = rng.uniform(0.08, 0.16)
                 contrast = rng.uniform(0.88, 0.98)
-                max_cast = rng.uniform(3.0, 8.0)
+                max_cast = rng.uniform(5.0, 12.0)
+                gamma_low, gamma_high = 0.94, 1.08
             elif subprofile == "faded_old_color":
-                fading_max = rng.uniform(0.25, 0.48)
-                warmth = rng.uniform(0.04, 0.12)
+                fading_max = rng.uniform(0.35, 0.62)
+                warmth = rng.uniform(0.12, 0.25)
                 contrast = rng.uniform(0.78, 0.92)
-                max_cast = rng.uniform(5.0, 13.0)
+                max_cast = rng.uniform(10.0, 24.0)
+                gamma_low, gamma_high = 0.88, 1.16
             elif subprofile == "moderate_sepia":
-                fading_max = rng.uniform(0.28, 0.52)
-                warmth = rng.uniform(0.06, 0.15)
+                fading_max = rng.uniform(0.40, 0.68)
+                warmth = rng.uniform(0.16, 0.30)
                 contrast = rng.uniform(0.76, 0.90)
-                max_cast = rng.uniform(6.0, 14.0)
-                sepia = rng.uniform(0.18, 0.42)
+                max_cast = rng.uniform(12.0, 26.0)
+                gamma_low, gamma_high = 0.85, 1.20
+                sepia = rng.uniform(0.28, 0.55)
                 result = self._apply_sepia_strength(result, sepia)
                 applied["sepia"] = sepia
             else:
-                fading_max = rng.uniform(0.40, 0.58)
-                warmth = rng.uniform(0.08, 0.17)
+                fading_max = rng.uniform(0.52, 0.75)
+                warmth = rng.uniform(0.20, 0.36)
                 contrast = rng.uniform(0.70, 0.86)
-                max_cast = rng.uniform(8.0, 17.0)
-                sepia = rng.uniform(0.20, 0.45)
+                max_cast = rng.uniform(16.0, 32.0)
+                gamma_low, gamma_high = 0.80, 1.25
+                sepia = rng.uniform(0.35, 0.65)
                 result = self._apply_sepia_strength(result, sepia)
                 applied["sepia"] = sepia
 
@@ -366,7 +370,7 @@ class DegradationSimulator:
             result = self._apply_warm_paper_tone(result, warmth)
             result = self._apply_low_contrast(result, contrast, rng.uniform(0.0, 7.0))
             result, cast_metadata = self._apply_low_frequency_cast(result, max_cast, rng, np_rng)
-            gammas = [rng.uniform(0.90, 1.12) for _ in range(3)]
+            gammas = [rng.uniform(gamma_low, gamma_high) for _ in range(3)]
             result = self._apply_channel_gamma(result, gammas)
             applied.update(
                 {
