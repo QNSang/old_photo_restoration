@@ -12,12 +12,27 @@ import cv2
 import numpy as np
 
 
-OFFICIAL_LAMA_REPO = Path(r"F:\deeplearning\external_models\lama\lama")
-OFFICIAL_LAMA_CPU_ENV = "lama"
-OFFICIAL_LAMA_GPU_ENV = "lama_gpu"
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_OFFICIAL_LAMA_WORKSPACE = (
+    Path(r"F:\deeplearning\external_models\lama")
+    if os.name == "nt"
+    else PROJECT_ROOT / "external_models" / "lama"
+)
+OFFICIAL_LAMA_REPO = Path(
+    os.environ.get("OFFICIAL_LAMA_REPO", str(DEFAULT_OFFICIAL_LAMA_WORKSPACE / "lama"))
+).expanduser()
+OFFICIAL_LAMA_CPU_ENV = os.environ.get("OFFICIAL_LAMA_CPU_ENV", "lama")
+OFFICIAL_LAMA_GPU_ENV = os.environ.get("OFFICIAL_LAMA_GPU_ENV", "lama_gpu")
 OFFICIAL_LAMA_ENV = OFFICIAL_LAMA_CPU_ENV
-OFFICIAL_LAMA_CHECKPOINT = Path(r"F:\deeplearning\external_models\lama\weights\big-lama\models\best.ckpt")
-OFFICIAL_LAMA_MODEL_DIR = OFFICIAL_LAMA_CHECKPOINT.parents[1]
+OFFICIAL_LAMA_CHECKPOINT = Path(
+    os.environ.get(
+        "OFFICIAL_LAMA_CHECKPOINT",
+        str(DEFAULT_OFFICIAL_LAMA_WORKSPACE / "weights" / "big-lama" / "models" / "best.ckpt"),
+    )
+).expanduser()
+OFFICIAL_LAMA_MODEL_DIR = Path(
+    os.environ.get("OFFICIAL_LAMA_MODEL_DIR", str(OFFICIAL_LAMA_CHECKPOINT.parent.parent))
+).expanduser()
 OFFICIAL_LAMA_BACKEND = "official_lama_pretrained"
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
 
